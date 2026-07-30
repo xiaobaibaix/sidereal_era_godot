@@ -389,9 +389,11 @@ func occlusion_mode_text() -> String:
 	if not p.occlusionCulling:
 		return "关"
 	# 不用局部变量名 name —— 会遮蔽 Node.name 触发 SHADOWED_VARIABLE 警告。
-	var algo: String = "Hi-Z(1帧延迟)" if _occl_mode == OCCL_MODE_HIZ else "解析射线(无延迟)"
+	# 括号内用 ASCII: 之前写"延迟", 但「迟」字在 HUD 的 fallback 字体里缺字形, 渲染成方框(tofu)。
+	# 技术词直接用英文既避开缺字, 也不影响可读性。
+	var algo: String = "Hi-Z(1-frame lag)" if _occl_mode == OCCL_MODE_HIZ else "RayMarch(realtime)"
 	if not _occlusion_applied:
-		return algo + "[此模式停用]"   # 意愿开但当前相机模式(PLANET)不启用
+		return algo + "[off in this cam mode]"   # 意愿开但当前相机模式(PLANET)不启用
 	return algo
 
 
