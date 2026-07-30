@@ -5,14 +5,17 @@
 //
 // 输入: trav_tex(lod_traverse 写好的 patch 纹理, 含末行 META_ROW count)
 // 输出: cull_tex(同布局, 仅含通过裁剪的 patch), 末行 META_ROW 由 metadata 模式写
-// MinMax: per-face Texture2DArray 层, R32G32_SFLOAT = (min, max) 径向位移(世界单位)
+// MinMax: per-face Texture2DArray 层, R32G32_SFLOAT = (min, max) 径向位移(**归一化**, 需乘
+//   fd.planet_center_pad.w = maxHeight 才是世界单位; 这样改 maxHeight 无需重烘, 详见 HeightmapBaker)
 //
 // 每个 invocation 处理一个候选 slot(thread_id ≥ count 直接 return)。
 // 流程:
 //   1. 读 trav_tex[slot] → A/B/C/face/level + bary
 //   2. bary_center = (ua+ub+uc)/3, (va+vb+vc)/3
 //   3. mip_k = bake_res_log2 - level(clamp [0, bake_res_log2])
-//   4. textureLod(minmax_tex, vec3(bary_center, face), mip_k) → (minH, maxH)
+//      bake_res = 2^MAX_GPU_LEVEL(=64) → mip_k ∈ [0, 6] 正好铺满整条 mip 链:
+//      level 6(最细)取 mip0(64×64, 一个 cell 一个 patch), level 0(整面)取 mip6(1×1)。
+//   4. textureLod(minmax_tex, vec3(bary_center, face), mip_k) × maxHeight → (minH, maxH)
 //   5. 构 6 点 AABB: 3 角点 × {minH, maxH} 径向位移
 //   6. 6-plane 视锥测试(Godot 约定: normal 内向; AABB P-vertex 任一平面 < 0 → 全外 → cull)
 //   7. 通过 → atomicAdd(cull_counter) 取槽, 复制 5 texel 到 cull_tex, texel5 写 (minH, maxH, 0, 0)
@@ -60,6 +63,10 @@ const int FACES[60] = int[60](
 	4, 9, 5,  2, 4, 11, 6, 2, 10, 8, 6, 7,  9, 8, 1
 );
 const int FACE_COUNT = 20;
+// 解析射线遮挡锚定的空间分辨率(log2)。6 → 每面 64×64 cell, 与 MAX_GPU_LEVEL 的最细 patch 同尺度:
+// 更细没意义(patch 本身就这么大), 更粗则 minH 偏小 → 判不出被挡 → 遮挡剔除白白变保守。
+// 采样 mip = bake_res_log2 - OCC_RES_LOG2, 所以 bake_res 怎么变, 空间分辨率都锚在 64×64。
+const float OCC_RES_LOG2 = 6.0;
 
 layout(push_constant, std430) uniform Push {
 	int mode;        // 0 = cull, -1 = reset counter, -2 = metadata(count → META_ROW)
@@ -206,8 +213,9 @@ bool _occluded_hiz(vec3 pts[12]) {
 // 与 Hi-Z 的本质区别: **只用当前帧相机 + 静态烘焙高度场, 不用任何跨帧数据** → 构造上不存在
 // "用上一帧深度决定这一帧可见性"的问题 → 不产生 disocclusion 黑洞。
 //
-// 判据: 沿"相机 → patch 点"线段步进, 查该处地形的**最小**高度 minH(烘焙 MinMax 的 R 通道)。
-// 若线段在某处的半径 < radius + minH, 则线段位于该处地形的**下界之下** → 地形【确定】挡住 → 可剔。
+// 判据: 沿"相机 → patch 点"线段步进, 查该处地形的**最小**高度 minH(烘焙 MinMax 的 R 通道,
+// 归一化 → 乘 maxHeight)。若线段在某处的半径 < radius + minH, 则线段位于该处地形的**下界之下**
+// → 地形【确定】挡住 → 可剔。
 // 用 minH(下界)而非 maxH 是保守性的关键: 实际地形 ≥ minH, 所以"低于 minH"必然被挡, 不会误剔。
 
 // 球面方向 d → 所属 ico 面 + face-bary。找到返回 face index 并写 uv; 找不到返回 -1。
@@ -266,8 +274,13 @@ bool _blocked_by_terrain(vec3 P, vec3 cam, vec3 center, float radius, float mip)
 		if (f < 0 || uv.x < 0.0 || uv.y < 0.0 || uv.x + uv.y > 1.0) {
 			continue;   // 落在面外(数值边界) → 跳过, 不判被挡(保守)
 		}
-		float minH = textureLod(minmax_tex, vec3(uv, float(f)), mip).r;
-		if (r_S < radius + minH) {
+		float minH_n = textureLod(minmax_tex, vec3(uv, float(f)), mip).r;   // 归一化
+		if (minH_n > 1.0e20) {
+			continue;   // 哨兵 cell(三角形外) → 无高度信息, 不判被挡(保守)。
+			            // 上面的 uv 守卫理论上已排除它(floor(u·e)+floor(v·e) ≤ floor((u+v)·e) ≤ e-1),
+			            // 但哨兵一旦漏进来会让 radius+minH 变成天文数字 → 整片误剔, 代价太大, 加一道。
+		}
+		if (r_S < radius + minH_n * fd.planet_center_pad.w) {
 			return true;   // 线段低于该处地形下界 → 确定被挡
 		}
 	}
@@ -318,11 +331,14 @@ void main() {
 	// ---- 采样 MinMax: mip = bake_res_log2 - level(size-matched) ----
 	int bake_res_log2 = int(fd.consts.x);
 	int mip = clamp(bake_res_log2 - level, 0, bake_res_log2);
-	vec2 minmax = textureLod(minmax_tex, vec3(bary_center, float(face)), float(mip)).rg;
-	float minH = minmax.x;
-	float maxH = minmax.y;
-	// 哨兵(三角形外的 cell, 不应发生但守卫): 不裁剪这一槽, 视为通过(让 vertex 处理)
-	bool sentinel = (minH > 1.0e20) || (maxH < -1.0e20);
+	vec2 minmax_n = textureLod(minmax_tex, vec3(bary_center, float(face)), float(mip)).rg;
+	// 哨兵(三角形外的 cell, 不应发生但守卫): 不裁剪这一槽, 视为通过(让 vertex 处理)。
+	// 判据必须用**未缩放**的归一化值 —— 哨兵是 ±1e30, 乘 maxHeight(可以为 0)就变 0 → 漏检。
+	bool sentinel = (minmax_n.x > 1.0e20) || (minmax_n.y < -1.0e20);
+	// 纹理存归一化高度 → 乘 maxHeight 得世界单位径向位移。
+	float max_height = fd.planet_center_pad.w;
+	float minH = minmax_n.x * max_height;
+	float maxH = minmax_n.y * max_height;
 
 	// ---- 6 点 AABB: 3 角点 × {minH, maxH} 径向位移 ----
 	vec3 center = fd.planet_center_pad.xyz;
@@ -413,8 +429,11 @@ void main() {
 			// 模式 2: 解析地形射线(方案 B)。只测 **maxH 处** 的 6 点(3 角 + 3 边中): 同方向上半径越高
 			// 越容易越过山脊被看见, 所以"最高点都被挡" ⇒ 其下方各点也被挡 → 测最高点即保守充分。
 			// 任一点未被挡 → patch 可能可见 → 立即不剔(早退, 可见 patch 的常见路径也最省)。
-			// mip 取 2(min over 4×4 cell): 比 mip0(单点采样, 不严格包夹)更保守, 抗实时噪声偏差。
-			float mip_occ = min(2.0, fd.consts.x);
+			// mip 按空间分辨率锚定(见 OCC_RES_LOG2), bake_res=64 时即 mip0。
+			// 旧代码写死 min(2.0, consts.x) —— 那只在 bake_res=256 下恰好等于 64×64, bake_res 一降
+			// 就悄悄变成 16×16、遮挡剔除莫名变弱。mip0 现在是 cell 区域的真实极值(baker 做了
+			// SUPERSAMPLE² 超采样), 严格包夹, 旧注释担心的"单点采样不严格包夹"已不成立。
+			float mip_occ = max(0.0, fd.consts.x - OCC_RES_LOG2);
 			vec3 cam_w = fd.cam_pos_pad.xyz;
 			if (_blocked_by_terrain(center + A * r_hi, cam_w, center, radius, mip_occ)
 					&& _blocked_by_terrain(center + B * r_hi, cam_w, center, radius, mip_occ)

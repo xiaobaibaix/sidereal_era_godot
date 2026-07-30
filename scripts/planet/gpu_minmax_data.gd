@@ -16,7 +16,14 @@
 ## 有效性: cell 中心在三角形内 ⟺ u + v ≤ 1 ⟺ i + j ≤ bake_res - 1 ⟺ i + j < bake_res。
 ## 无效 cell 存哨兵(MIN_SENTINEL, MAX_SENTINEL), 归约时跳过。
 ##
-## 数值单位: 世界单位(= height_at × maxHeight), 与 radius 同量纲 → min/max 直接给径向包围盒。
+## 数值单位: **归一化高度**(= Terrain.height_at 的原始输出, 未乘 maxHeight)。消费侧(lod_cull.glsl
+## 用 fd.planet_center_pad.w、GpuPlanet 用 params.maxHeight)自行缩放成世界单位。
+## 为什么归一化: maxHeight 只是个线性缩放, 烘进数据等于让它进 seed_hash —— 拖一次高度滑条就得重烘
+## 全部 20 面并多存一个 .res。与 radius 早先被移出 seed_hash 是同一个道理(见 heightmap_baker 注释)。
+##
+## mip0 语义: **cell 区域的真实极值**, 不是 cell 中心单点值。baker 在每个 cell 内做 SUPERSAMPLE²
+## 超采样取 min/max(见 heightmap_baker)。这点对保守性是必要的 —— 单点采样时 min=max, 包围盒不包夹
+## cell 内的地形起伏, 视锥/遮挡剔除有削掉可见山尖的风险。
 ##
 ## @tool: GpuPlanet/GpuLodCompositor 是 @tool, 在编辑器里也会加载缓存的 MinMax .res 并调
 ## build_pyramid()。若本脚本非 @tool, 编辑器加载出的是"占位实例"(placeholder), 调方法会报
@@ -29,9 +36,15 @@ const MIN_SENTINEL: float = 1.0e30
 const MAX_SENTINEL: float = -1.0e30
 
 ## Baker 版本: 进入 seed_hash, 改 baker 算法时 +1 使旧缓存失效。
-const BAKER_VERSION: int = 2   # v2 = cell 布局 + gather 归约(取代 v1 vertex 布局 + scatter)
+## v2 = cell 布局 + gather 归约(取代 v1 vertex 布局 + scatter)
+## v3 = 归一化高度(不再乘 maxHeight) + cell 内超采样取区域极值
+const BAKER_VERSION: int = 3
 
-@export var bake_res: int = 1024
+## 默认 = GpuLodCompositor.BAKE_RES。不写 1024 之类的"通用大值": set_minmax 有
+## `bake_res != BAKE_RES` 的硬校验, 默认值与实际值不一致纯属陷阱。
+@export var bake_res: int = 64
+## 烘焙时的 radius / maxHeight。**仅供诊断记录**, 不参与任何计算 —— 数据是归一化的, 与两者都无关
+## (所以 seed_hash 也不含它们, 改半径/改高度都直接命中缓存)。
 @export var radius: float = 100.0
 @export var max_height: float = 8.0
 @export var seed_hash: int = 0
@@ -44,6 +57,13 @@ var _pyramid: Array = []   # 缓存: [face][mip] = PackedFloat32Array; 懒建
 # bake_res 必须 2 的幂(保证逐级对半归约到 1)。
 static func is_valid_res(res: int) -> bool:
 	return res >= 2 and (res & (res - 1)) == 0
+
+
+# 丢弃缓存的金字塔, 下次 build_pyramid() 重建。
+# 面级并行烘焙会绕过 set_face_mip0 直接写 face_mip0[fi](避免 20 个 worker 并发碰 _pyramid),
+# 所以烘完由调度方显式调一次。
+func invalidate_pyramid() -> void:
+	_pyramid = []
 
 
 # 设面 fi 的 mip0(烘焙器写入用)。
@@ -89,39 +109,35 @@ func _build_face_pyramid(mip0: PackedFloat32Array) -> Array:
 		var cur_edge: int = prev_edge >> 1
 		var cur: PackedFloat32Array = PackedFloat32Array()
 		cur.resize(cur_edge * cur_edge * 2)
-		# 初始化全哨兵
-		for k in range(cur.size()):
-			cur[k] = MIN_SENTINEL if (k & 1) == 0 else MAX_SENTINEL
-		# gather 归约: 每 parent cell 累计 4 个 children
+		# gather 归约: 每 parent cell 累计 4 个 children。
+		# 每个 parent 都会被无条件写一次 → 不需要预先把整块刷成哨兵(那趟循环占了归约总迭代数的
+		# 1/3 且纯属浪费)。4 个 child 全是哨兵时 pmn/pmx 保持初值哨兵, 语义正好是"整块在三角形外"。
 		for jp in range(cur_edge):
 			for ip in range(cur_edge):
 				var pmn: float = MIN_SENTINEL
 				var pmx: float = MAX_SENTINEL
-				var any_valid: bool = false
 				for dj in range(2):
 					for di in range(2):
-						var ci: int = ip * 2 + di
-						var cj: int = jp * 2 + dj
-						var src: int = (cj * prev_edge + ci) * 2
+						var src: int = ((jp * 2 + dj) * prev_edge + (ip * 2 + di)) * 2
 						var cmn: float = prev[src]
 						if cmn >= MIN_SENTINEL * 0.5:
 							continue   # child 是 sentinel, 跳过
-						any_valid = true
 						pmn = min(pmn, cmn)
 						pmx = max(pmx, prev[src + 1])
-				if any_valid:
-					var dst: int = (jp * cur_edge + ip) * 2
-					cur[dst] = pmn
-					cur[dst + 1] = pmx
+				var dst: int = (jp * cur_edge + ip) * 2
+				cur[dst] = pmn
+				cur[dst + 1] = pmx
 		mips.append(cur)
 		prev = cur
 		prev_edge = cur_edge
 	return mips
 
 
-# 全局最小径向位移(世界单位, 通常 ≤ 0 表海沟)。取每面金字塔顶层(1×1 cell = 整面 min/max)的 min,
-# 再对 20 面取 min。用途: 地平线剔除的 occluder 球半径 = radius + global_min_disp —— 该球保证内含于
+# 全局最小径向位移(**归一化**, 通常 ≤ 0 表海沟; 乘 maxHeight 才是世界单位)。取每面金字塔顶层
+# (1×1 cell = 整面 min/max)的 min, 再对 20 面取 min。
+# 用途: 地平线剔除的 occluder 球半径 = radius + global_min_disp × maxHeight —— 该球保证内含于
 # 实心行星(地形处处 ≥ 此位移), "在球背面" ⟹ "被行星挡住", 不会误剔可见 patch。
+# 缩放在调用侧做(GpuPlanet._process 用**当前** maxHeight 现算), 这样改高度立即生效、无需重烘。
 func global_min_disp() -> float:
 	var pyr: Array = build_pyramid()
 	var gmin: float = MIN_SENTINEL
@@ -137,7 +153,8 @@ func global_min_disp() -> float:
 	return gmin
 
 
-# 最近邻采样面 fi 指定 mip 的 (u, v) 的 (min, max)。u, v∈[0,1]。
+# 最近邻采样面 fi 指定 mip 的 (min, max)(**归一化**, 同 mip0 语义)。u, v∈[0,1]。
+# 与 lod_cull.glsl 的 textureLod(NEAREST) 取同一个 cell, 供 CPU 侧交叉验证用。
 # 找包含 (u, v) 的 cell: i = floor(u * edge_k), j = floor(v * edge_k)。
 # 返回 (min, max); 若 cell 是哨兵(u, v 落到三角形外), 返回哨兵对。
 func sample_nearest(fi: int, mip: int, u: float, v: float) -> Vector2:

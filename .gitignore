@@ -5,3 +5,7 @@
 .vscode/
 .claude/
 .DS_Store
+
+# MinMax 烘焙缓存: 派生产物, 删掉后首次运行会自动重烘并存盘(见 HeightmapBaker/GpuPlanet)。
+# 文件名带 seed_hash + 分辨率, 调参会不断新增, 不该进版本库。
+/data/

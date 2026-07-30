@@ -30,6 +30,7 @@ radius = 1050.0
 maxHeight = 40.0
 showInset = false
 showOcean = false
+showAtmosphere = false
 showClouds = false
 showGodrays = false
 metadata/_custom_type_script = "uid://7boxikbjeden"
@@ -58,13 +59,14 @@ planet_path = NodePath("..")
 external_camera = NodePath("../Camera3D")
 
 [node name="Camera3D" type="Camera3D" parent="GpuPlanet" unique_id=2085450478]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 86.43082, 432.3692, 921.5506)
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 86.43082, 432.3692, 2041.5603)
 script = ExtResource("1_invnv")
 
 [node name="PlanetAtmosphere" type="Node3D" parent="GpuPlanet" unique_id=2088287272 node_paths=PackedStringArray("planet", "sun_light")]
 script = ExtResource("8_atmo")
 planet = NodePath("..")
 sun_light = NodePath("../../DirectionalLight3D")
+enabled = false
 
 [node name="LODDebug" type="Node" parent="." unique_id=1748920366]
 script = ExtResource("4_dbg")

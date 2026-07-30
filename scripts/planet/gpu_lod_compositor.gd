@@ -30,7 +30,16 @@ const MAX_PATCHES := 12288         # 与 shader MAX_PATCHES 一致(PATCH_TEX_H=1
 const PATCH_TEX_W := 6             # 每 patch 6 texel
 const PATCH_TEX_H := MAX_PATCHES + 1   # 末行存 count metadata
 const WG := 64                     # workgroup size(与 glsl local_size_x 一致)
-const BAKE_RES := 256              # MinMax 烘焙分辨率(2^8=256; maxLevel 6 最细 64 细分/边 → 每 patch ~4 cell, 保守包围盒足够。512 过度精细且烘焙慢 4×)
+# MinMax 烘焙分辨率。**必须 = 2^MAX_GPU_LEVEL(=64)**, 不多不少 —— 这是由消费侧的 mip 取值范围推出来的:
+#   视锥/AABB:  mip = bake_res_log2 - level, level ∈ [0, MAX_GPU_LEVEL=6]
+#   射线遮挡:   mip_occ = bake_res_log2 - MAX_GPU_LEVEL(见 lod_cull.glsl, 固定 64×64 空间分辨率)
+# bake_res_log2 = 6 时 mip ∈ [0, 6] 正好铺满整条 mip 链: level 6 用 mip0(64×64, 一个 cell 一个最细
+# patch), level 0 用 mip6(1×1, 整面)。
+# 曾经是 256(log2=8) → mip ∈ [2, 8] → **mip0(256²) 与 mip1(128²) 永远不会被任何 shader 采样**,
+# 而入盘的恰恰是 mip0 → 磁盘 10MB / 显存 13.1MB 里只有 874KB(6.7%)被读过, build_pyramid 94% 的
+# GDScript 迭代在归约死数据, 加载因此明显卡顿。降到 64 后: 磁盘 655KB, 显存 874KB, 归约快 16×。
+# 包围盒质量不靠分辨率堆, 靠 heightmap_baker 的 cell 内超采样保证(见该文件 SUPERSAMPLE)。
+const BAKE_RES := 64
 # FrameData UBO(std140): frustum[6](96) + cam(16) + planet(16) + consts(16)
 #   + cull_params(16) + hiz_params(16) + view_proj mat4(64) + view_proj_cur mat4(64) = 304 字节。
 # Phase 5 新增: cull_params(地平线/小三角/遮挡开关+参数)、hiz_params(金字塔元数据)、view_proj(遮挡投影)。

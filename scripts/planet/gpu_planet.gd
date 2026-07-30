@@ -87,12 +87,18 @@ var _hiz_comp: GpuHizCompositor   # Phase 5: 遮挡剔除深度金字塔(POST_OP
 # 否则改 radius 后它会滞留旧值(旧代码只在 _apply_minmax 里算), 半径变小时遮挡球比行星还大 →
 # 地平线剔除把整颗星球都判成"背面" → 大面积消失, 直到重烘完成才恢复。
 # NAN = 尚无烘焙数据 → 用保守下界 radius - maxHeight。
+# 单位: **归一化**(烘焙数据不含 maxHeight), 用时乘当前 params.maxHeight。
 var _minmax_min_disp: float = NAN
 var _frame: int = 0   # 双缓冲帧计数(GpuPlanet 主线程拥有; 决定 compositor 写哪块、绑哪块)
-# 后台烘焙: 20×BAKE_RES² 噪声采样太重(~260 万次 height_at), 放主线程 _ready 会卡死编辑器/运行。
-# 改为 WorkerThreadPool 后台跑, 期间 minmax 未就绪 → _process 绑 fallback(20 面)先渲染, 完成后切 GPU LOD。
-var _bake_task_id: int = -1
-var _bake_result: GpuMinMaxData
+# 后台烘焙: 20 面 × BAKE_RES² cell × SUPERSAMPLE² 采样 ≈ 65 万次 height_at, 放主线程 _ready 会卡死
+# 编辑器/运行。改为 WorkerThreadPool **面级并行**(add_group_task, 20 个面各一个 work item → 吃满
+# 核数, 比单任务串行快一个数量级), 期间 minmax 未就绪 → _process 绑 fallback(20 面)先渲染, 完成后
+# 切 GPU LOD。
+# 为什么用 group task 而不是"单个 add_task 里再 add_group_task + wait": 后者是在 worker 线程里等
+# 另一组 worker, 有死锁隐患; 直接由主线程发起 group、每帧轮询 is_group_task_completed 最干净。
+var _bake_group_id: int = -1
+var _bake_result: GpuMinMaxData     # group task 期间由 worker 并发写 face_mip0[fi](各写各的, 无锁)
+var _bake_terrain: Terrain          # 共享只读噪声实例(height_at 不写成员 → 并发安全)
 var _bake_save_path: String = ""
 # LOD 冻结(调试用): 冻结后 _process 用快照的相机位置/参数驱动 LOD, 不再读实时相机。
 # 配合旁观相机(planet_lod_debug.gd)绕看冻结后的地形。视锥用空 → cull 全通过 → 整球可见。
@@ -138,10 +144,11 @@ func _ready() -> void:
 
 func _exit_tree() -> void:
 	# 等后台烘焙结束, 避免 worker 线程写入已释放的对象。
-	if _bake_task_id != -1:
-		WorkerThreadPool.wait_for_task_completion(_bake_task_id)
-		_bake_task_id = -1
+	if _bake_group_id != -1:
+		WorkerThreadPool.wait_for_group_task_completion(_bake_group_id)
+		_bake_group_id = -1
 		_bake_result = null
+		_bake_terrain = null
 	# 摘掉 compositor(避免旧 WorldEnvironment 残留 effect 空跑)
 	if _lod_comp != null or _hiz_comp != null:
 		var we := _find_world_environment()
@@ -252,7 +259,9 @@ func _process(_delta: float) -> void:
 	# 有烘焙数据 → radius + 全局最小位移(更紧); 没有 → 保守下界 radius - maxHeight。
 	var occluder_r: float = maxf(p.radius - p.maxHeight, 1.0)
 	if not is_nan(_minmax_min_disp):
-		occluder_r = maxf(p.radius + _minmax_min_disp, 1.0)
+		# _minmax_min_disp 是**归一化**的(烘焙产物不含 maxHeight) → 这里用当前 maxHeight 缩放,
+		# 于是改半径、改高度都立即生效且都不触发重烘。
+		occluder_r = maxf(p.radius + _minmax_min_disp * p.maxHeight, 1.0)
 	_lod_comp.set_frame_data({
 		"cam_pos": cam_pos,
 		"planet_center": global_position,
@@ -447,30 +456,51 @@ func _bake_and_push_minmax() -> void:
 			print("[GpuPlanet] MinMax 缓存命中 → 直接加载, GPU LOD 立即激活")
 			_apply_minmax(cached as GpuMinMaxData)
 			return
-	# 未命中 → 后台线程烘焙(避免主线程/编辑器卡死); 期间用 fallback 20 面渲染。
-	if _bake_task_id != -1:
+	# 未命中 → 后台面级并行烘焙(避免主线程/编辑器卡死); 期间用 fallback 20 面渲染。
+	if _bake_group_id != -1:
 		return   # 已有烘焙在跑, 不重复提交
 	_bake_save_path = path
-	_bake_result = null
-	_bake_task_id = WorkerThreadPool.add_task(_bake_task.bind(p), false, "planet minmax bake")
-	print("[GpuPlanet] MinMax 缓存未命中 → 后台烘焙中(先用 20 面 fallback, 烘完自动切 GPU LOD)")
+	# 空壳 + 共享噪声实例都在主线程建好: face_mip0 容量一次性定好, 20 个 worker 只写各自的索引,
+	# 既不 resize 也不碰 _pyramid → 无需加锁。
+	_bake_result = HeightmapBaker.new_data(p, GpuLodCompositor.BAKE_RES)
+	_bake_terrain = Terrain.from_params(p)
+	_bake_group_id = WorkerThreadPool.add_group_task(
+		_bake_face_task, GpuIco.FACE_COUNT, -1, false, "planet minmax bake")
+	print("[GpuPlanet] MinMax 缓存未命中 → 后台并行烘焙中(先用 20 面 fallback, 烘完自动切 GPU LOD)")
 
 
-# 后台线程体: 纯 CPU 噪声采样, 不碰 RenderingDevice / 场景树。结果由主线程 _poll_async_bake 取走。
-func _bake_task(p: PlanetParams) -> void:
-	_bake_result = HeightmapBaker.bake(p, GpuLodCompositor.BAKE_RES)
+# group task 体(worker 线程, 每面一个): 纯 CPU 噪声采样, 不碰 RenderingDevice / 场景树。
+# 只写 face_mip0[fi] 这一个槽, 与其它 fi 互不重叠。结果由主线程 _poll_async_bake 取走。
+func _bake_face_task(fi: int) -> void:
+	if _bake_result == null or _bake_terrain == null:
+		return
+	_bake_result.face_mip0[fi] = HeightmapBaker.bake_face(
+		_bake_terrain, GpuLodCompositor.BAKE_RES, fi)
 
 
 # 主线程每帧轮询: 后台烘焙完成 → 存盘缓存(下次秒开) + 上传 GPU。
 func _poll_async_bake() -> void:
-	if _bake_task_id == -1 or not WorkerThreadPool.is_task_completed(_bake_task_id):
+	if _bake_group_id == -1 or not WorkerThreadPool.is_group_task_completed(_bake_group_id):
 		return
-	WorkerThreadPool.wait_for_task_completion(_bake_task_id)   # 已完成, 立即返回; 提供内存屏障
+	WorkerThreadPool.wait_for_group_task_completion(_bake_group_id)   # 已完成, 立即返回; 提供内存屏障
 	var data: GpuMinMaxData = _bake_result
-	_bake_task_id = -1
+	_bake_group_id = -1
 	_bake_result = null
+	_bake_terrain = null
 	if data == null:
 		return
+	# worker 直接写了 face_mip0(绕过 set_face_mip0)→ 显式丢弃可能的旧金字塔缓存。
+	data.invalidate_pyramid()
+	# 齐全性校验: 面级并行下任何一面没写成(worker 异常 / 提前退出)都会留 null, 而 build_pyramid
+	# 会拿空数组去索引 → 崩在 _build_face_pyramid。宁可这里整批丢弃, 等下次触发重烘。
+	var expect_len: int = GpuLodCompositor.BAKE_RES * GpuLodCompositor.BAKE_RES * 2
+	for fi in range(GpuIco.FACE_COUNT):
+		var face_arr: Variant = data.face_mip0[fi] if fi < data.face_mip0.size() else null
+		if not (face_arr is PackedFloat32Array) \
+				or (face_arr as PackedFloat32Array).size() != expect_len:
+			push_warning(
+				"[GpuPlanet] 烘焙结果不完整(face %d), 丢弃本次结果; 下次参数变更或重启会重烘" % fi)
+			return
 	# 存盘: 下次启动 _bake_and_push_minmax 命中缓存, 直接 load 跳过烘焙。
 	if _bake_save_path != "":
 		var dir_path: String = _bake_save_path.get_base_dir()
@@ -487,7 +517,8 @@ func _poll_async_bake() -> void:
 func _apply_minmax(data: GpuMinMaxData) -> void:
 	if _lod_comp == null:
 		return
-	# Phase 5: 只缓存全局最小位移(与 radius 无关); occluder 半径由 _process 每帧用当前 radius 现算。
+	# Phase 5: 只缓存全局最小位移(归一化, 与 radius / maxHeight 都无关);
+	# occluder 半径由 _process 每帧用当前 radius + maxHeight 现算。
 	_minmax_min_disp = data.global_min_disp()
 	if not _lod_comp.set_minmax(data):
 		push_warning("[GpuPlanet] MinMax 上传失败(占位 fallback; LOD 不裁剪)")
