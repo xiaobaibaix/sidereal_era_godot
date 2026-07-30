@@ -26,9 +26,8 @@ glow_enabled = true
 
 [sub_resource type="Resource" id="Resource_25nq4"]
 script = ExtResource("4_2vvio")
-radius = 1050.0
+radius = 2000.0
 maxHeight = 40.0
-showInset = false
 showOcean = false
 showAtmosphere = false
 showClouds = false
@@ -49,7 +48,7 @@ shadow_enabled = true
 script = ExtResource("3_gp")
 params = SubResource("Resource_25nq4")
 camera = NodePath("Camera3D")
-preview_in_editor = false
+preview_in_editor = true
 patch_resolution = 8
 
 [node name="RobotCharacter" parent="GpuPlanet" unique_id=1570974038 node_paths=PackedStringArray("external_camera") instance=ExtResource("6_robot")]

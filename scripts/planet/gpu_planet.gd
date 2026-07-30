@@ -282,7 +282,10 @@ func _process(_delta: float) -> void:
 		"smallTriPixels": small_tri_px,
 		# 传**模式值**(0=关, 1=Hi-Z, 2=解析射线), 不是 bool —— shader 按它选算法。
 		"occlusionCulling": (float(_occl_mode) if occlusion_want else 0.0),
-		"frustumMargin": frustum_margin,
+		# 名字带 World 后缀是为了别跟配置项混: 这是**算好的世界单位外扩量**, 由 params.cullFrustumMargin
+		# (无量纲系数)乘距离换算而来。PlanetParams 里那个同名的 frustumMargin 字段已删(从来没人读它,
+		# 只是恰好跟这个字典键同名, 害得排查死参数时差点误判)。
+		"frustumMarginWorld": frustum_margin,
 		"lod_frozen": _lod_frozen,
 	})
 	# Phase 5: 驱动 Hi-Z compositor。

@@ -7,4 +7,3 @@ resource_local_to_scene = true
 script = ExtResource("1_0n3we")
 radius = 500.0
 seaLevel = -0.5
-walkSpeed = 10.0

@@ -3,6 +3,23 @@
 ## 运行时改属性也会触发 setter -> param_changed(key) 信号, 应用层据此实时响应。
 ##
 ## 持久化: 保存场景即持久化(资源内嵌或存 .tres); 也可 save_as_tres() 导出预设。
+##
+## 收录范围: **只放真的有消费者的参数**。这份资源曾经攒下 21 个无人读取的死字段(角色速度/重力、
+## 观察者速度、线框与画中画开关、自动日照、CPU LOD 时代的 splitFactor/prefetchFactor/splitBudget/
+## mergeHysteresis/nearRadius/geometricErrorScale/patchResolution/frustumMargin、大气重构后失效的
+## atmoACES/atmoLUT、已被替换的 occlusionMinAltitudeFrac), 在 Inspector 里调了却毫无反应, 是持续的
+## 困惑源。加字段前请确认有代码真的读它。
+## 反例参考: 角色的速度/跳跃/重力在 character_controller.gd 自己的 @export 上; 线框与画中画在
+## planet_lod_debug.gd 自己的状态里; patch 网格分辨率在 GpuPlanet.patch_resolution 上 —— 都不经这里。
+##
+## @tool 是**必须**的, 否则编辑器里 Inspector 调参毫无反应:
+## 非 @tool 的脚本在编辑器里被实例化成"占位实例"(placeholder) —— 属性读写走 placeholder 的存储,
+## setter **不执行** → param_changed 永不发出 → GpuPlanet._on_param_changed 不触发 → _push_params()
+## 不跑 → shader uniform(噪声种子/频率、配色、海洋、气候…)一直是旧值。
+## 只有 radius/maxHeight/maxLevel/sseThresholdPixels 例外, 因为 GpuPlanet._process 每帧重读它们,
+## 不依赖信号 —— 这正是"改半径有反应、改噪声没反应"的原因。
+## 同样的坑 GpuMinMaxData 也踩过(见该文件头部注释)。
+@tool
 class_name PlanetParams
 extends Resource
 
@@ -24,12 +41,6 @@ signal bulk_changed
 
 # ---- 外观 ----
 @export_group("外观")
-## 线框模式: 开启后整个行星以线框渲染(调试 LOD 用)。
-@export var wireframe: bool = false:
-	set(v): wireframe = v; param_changed.emit("wireframe")
-## 画中画(小窗口)开关(Phase 5)。
-@export var showInset: bool = true:
-	set(v): showInset = v; param_changed.emit("showInset")
 ## 海面 mesh 开关(Phase 2)。
 @export var showOcean: bool = true:
 	set(v): showOcean = v; param_changed.emit("showOcean")
@@ -43,27 +54,6 @@ signal bulk_changed
 @export var showGodrays: bool = true:
 	set(v): showGodrays = v; param_changed.emit("showGodrays")
 
-# ---- 相机与角色 ----
-@export_group("相机与角色")
-## 观察者(自由飞行)模式移动速度。
-@export_range(5.0, 400.0, 1.0) var spectatorSpeed: float = 80.0:
-	set(v): spectatorSpeed = v; param_changed.emit("spectatorSpeed")
-## 角色表面行走速度。
-@export_range(1.0, 200.0, 1.0) var walkSpeed: float = 25.0:
-	set(v): walkSpeed = v; param_changed.emit("walkSpeed")
-## 角色转向角速度(Q/E, 弧度/秒)。
-@export_range(0.0, 10.0, 0.05) var turnSpeed: float = 2.2:
-	set(v): turnSpeed = v; param_changed.emit("turnSpeed")
-## 起跳的径向初速度(沿径向向外)。
-@export_range(0.0, 300.0, 1.0) var jumpForce: float = 60.0:
-	set(v): jumpForce = v; param_changed.emit("jumpForce")
-## 径向重力加速度(角色始终被拉向行星中心)。
-@export_range(0.0, 600.0, 1.0) var gravity: float = 100.0:
-	set(v): gravity = v; param_changed.emit("gravity")
-## 鼠标纵向是否反转。
-@export var invertY: bool = true:
-	set(v): invertY = v; param_changed.emit("invertY")
-
 # ---- 太阳 ----
 @export_group("太阳")
 ## 太阳仰角(度, -90..90): 控制日高低。
@@ -72,12 +62,6 @@ signal bulk_changed
 ## 太阳方位角(度, 0..360): 控制日照方向。
 @export_range(0.0, 360.0, 0.5) var sunAzimuth: float = 40.0:
 	set(v): sunAzimuth = v; param_changed.emit("sunAzimuth")
-## 自动日照: 太阳自动绕行星转, 模拟昼夜。
-@export var autoSun: bool = false:
-	set(v): autoSun = v; param_changed.emit("autoSun")
-## 自动日照转速(度/秒)。
-@export_range(0.0, 60.0, 0.1) var sunSpeed: float = 6.0:
-	set(v): sunSpeed = v; param_changed.emit("sunSpeed")
 
 # ---- 大气散射 ----
 @export_group("大气散射")
@@ -125,18 +109,12 @@ signal bulk_changed
 ## 暮光增强(日出日落时暖色加强)。
 @export_range(0.0, 1.0, 0.01) var atmoTwilight: float = 0.3:
 	set(v): atmoTwilight = v; param_changed.emit("atmoTwilight")
-## ACES 色调映射开关(开: 电影感, 高光更柔和)。
-@export var atmoACES: bool = true:
-	set(v): atmoACES = v; param_changed.emit("atmoACES")
 ## 臭氧吸收量(影响天空/日落的青绿调)。
 @export_range(0.0, 0.3, 0.001) var atmoOzone: float = 0.02:
 	set(v): atmoOzone = v; param_changed.emit("atmoOzone")
 ## 抖动(去 banding 色带)强度。
 @export_range(0.0, 1.0, 0.01) var atmoDither: float = 0.5:
 	set(v): atmoDither = v; param_changed.emit("atmoDither")
-## 透射率 LUT 预烘焙开关(开: 更准、略多显存)。
-@export var atmoLUT: bool = true:
-	set(v): atmoLUT = v; param_changed.emit("atmoLUT")
 
 # ---- 体积云 ----
 @export_group("体积云")
@@ -224,12 +202,10 @@ signal bulk_changed
 # ---- LOD ----
 @export_group("LOD")
 ## 最大细分层数: 越大近处 patch 越细(细节越多, 但 patch 越多越费)。
+## 注: GPU 路径会被 GpuPlanet.MAX_GPU_LEVEL(=6) 钳住(min(maxLevel, 6)), 调到 6 以上不再有效果 ——
+## 该上限同时定死了 MinMax 烘焙分辨率(GpuLodCompositor.BAKE_RES = 2^6 = 64), 要动得两边一起改。
 @export_range(1, 12, 1) var maxLevel: int = 8:
 	set(v): maxLevel = v; param_changed.emit("maxLevel")
-## 细分触发倍率(已废弃, 仅遗留 target_level_at 死代码用): select_lod 现在走 SSE 公式,
-## 真正生效的是 sseThresholdPixels + geometricErrorScale。保留此字段仅为向后兼容旧场景文件。
-@export_range(1.0, 6.0, 0.05) var splitFactor: float = 2.5:
-	set(v): splitFactor = v; param_changed.emit("splitFactor")
 ## 屏幕空间误差阈值(像素): chunk 在屏幕上的几何误差超过此值才细分。
 ## SSE = geometric_error × viewport_height / (distance × 2 × tan(fov_y/2))。
 ## 越小越严格(更精细, 更费 GPU); 越大越省(更粗糙)。
@@ -237,24 +213,6 @@ signal bulk_changed
 ## 默认 5.0(平衡档, 比 web 版旧 splitFactor=2.5 略省 → 近地 FPS 略升); 卡顿就调到 8~12, 想精细就调到 3。
 @export_range(1.0, 32.0, 0.5) var sseThresholdPixels: float = 5.0:
 	set(v): sseThresholdPixels = v; param_changed.emit("sseThresholdPixels")
-## 几何误差缩放: level L 的 chunk 几何误差 = maxHeight × geometricErrorScale / 2^L。
-## >1 更早细分(认为地形细节比 maxHeight/2^L 更粗), <1 更晚细分(认为更细)。
-## 用于手动微调, 多数情况保持 1.0 即可。
-@export_range(0.1, 4.0, 0.05) var geometricErrorScale: float = 1.0:
-	set(v): geometricErrorScale = v; param_changed.emit("geometricErrorScale")
-## 预取环倍率(>1): 进入 edge_len × splitFactor × prefetchFactor 即后台预生成下一级,
-## 到 splitFactor 才显示。摊平生成峰值、消除 pop-in。=1 关闭预取。
-@export_range(1.0, 3.0, 0.05) var prefetchFactor: float = 1.4:
-	set(v): prefetchFactor = v; param_changed.emit("prefetchFactor")
-## 每片 patch 的网格分辨率(必须是 2 的幂)。越大单 patch 顶点越多、越平滑、越费。
-@export_range(4, 64, 1) var patchResolution: int = 16:
-	set(v): patchResolution = v; param_changed.emit("patchResolution")  # 必须 2 的幂
-## 视锥剔除余量: 越大越晚剔除(减少旋转时 pop-in, 但多渲染些视锥外 patch)。
-@export_range(0.0, 1.0, 0.01) var frustumMargin: float = 0.15:
-	set(v): frustumMargin = v; param_changed.emit("frustumMargin")
-## 近距半径: 相机距 patch < 此值时强制按距离细分、不参与视锥剔除(避免环视时背后补细分)。
-@export_range(1.0, 500.0, 1.0) var nearRadius: float = 50.0:
-	set(v): nearRadius = v; param_changed.emit("nearRadius")
 ## 地平线剔除(移植 web 版): 剔掉被行星本体挡在背面的 chunk。站在地表/贴近时约一半 chunk 在背面 →
 ## 直接跳过遍历与渲染, 大幅降 patch/三角数(角色模式性能主要来源)。远距观察全球时天然无剔除。
 @export var horizonCulling: bool = true:
@@ -272,13 +230,6 @@ signal bulk_changed
 ## 运行时可按 F3 开关对比。
 @export var occlusionCulling: bool = true:
 	set(v): occlusionCulling = v; param_changed.emit("occlusionCulling")
-## 遮挡剔除的最低高度门限(占半径的比例)。相机离地表高度 < 半径×此值时**自动关闭**遮挡剔除。
-## 原因: 遮挡用上一帧深度(约 1~2 帧延迟), 贴近地表快速平移时"上一帧被挡、这一帧转出来"的地形会
-## 因仍被判定遮挡而剔掉 → 露出黑洞(disocclusion pop-in)。而贴地时地平线+视锥剔除已剔掉大半, 遮挡收益低;
-## 太空/远观时遮挡收益高且几乎无 disocclusion。故按高度分档: 贴地关、远观开。带滞回避免门限附近抖动。
-## 0 = 不按高度关(始终按 occlusionCulling 开关)。建议 0.3~0.6。
-@export_range(0.0, 2.0, 0.05) var occlusionMinAltitudeFrac: float = 0.4:
-	set(v): occlusionMinAltitudeFrac = v; param_changed.emit("occlusionMinAltitudeFrac")
 ## 视锥外扩余量的安全系数(补偿 GPU 剔除的 1 帧延迟)。剔除结果比画面晚一帧, 且贴近地表、地形铺满全屏时,
 ## 紧贴屏幕边缘的 patch 稍有偏差就露出黑色空洞。此系数控制视锥外扩量 = 常驻保险带(消除静止时的边缘空洞)
 ## + 本帧相机运动量(补偿快速平移/俯仰的 1 帧延迟), 都按"相机→地平线"距离换算。静止时仍留常驻保险带。
@@ -286,14 +237,6 @@ signal bulk_changed
 ## 建议 2~4; 贴近地表还看到边缘黑三角就往上调。
 @export_range(0.0, 8.0, 0.1) var cullFrustumMargin: float = 2.5:
 	set(v): cullFrustumMargin = v; param_changed.emit("cullFrustumMargin")
-## 合并滞回(像素域, 适用于 SSE): 分裂阈 split_d = g_err×K/T; 合并阈 merge_d = split_d × mergeHysteresis。
-## 两阈之间留死区 → 消除细分边界来回抖动(churn), 取代旧的 retired 合并缓存。
-@export_range(1.0, 2.0, 0.01) var mergeHysteresis: float = 1.15:
-	set(v): mergeHysteresis = v; param_changed.emit("mergeHysteresis")
-## 每帧分裂预算(移植 web 版): 单个 LOD pass 最多新分裂多少个 chunk。限制靠近时 worker 队列瞬时暴涨,
-## 把生成峰值摊到多帧。预算用完的 chunk 本帧退化为叶(父层暂显), 下帧继续。
-@export_range(1, 64, 1) var splitBudget: int = 16:
-	set(v): splitBudget = v; param_changed.emit("splitBudget")
 
 # ---- 大陆噪声 fBm ----
 @export_group("大陆噪声")
@@ -374,7 +317,7 @@ func save_as_tres(path: String) -> Error:
 
 ## 这些 key 的变更需要重建地形网格(而非实时更新)
 const REBUILD_KEYS := [
-	"radius", "maxHeight", "patchResolution",
+	"radius", "maxHeight",
 	"continentSeed", "continentFreq", "continentOctaves", "continentGain", "continentLacunarity",
 	"mountainSeed", "mountainFreq", "mountainOctaves", "mountainStrength",
 	"warpSeed", "warpStrength", "warpFreq",

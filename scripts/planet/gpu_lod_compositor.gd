@@ -546,7 +546,7 @@ func _update_frame_ubo(fd: Dictionary) -> void:
 	var frustum: Array = fd.get("frustum", [])
 	# 视锥外扩余量(世界单位): 内向法线约定下, plane.w += margin 把平面沿外向法线外推 margin →
 	# 视锥整体放大一圈。补偿剔除 1 帧延迟(相机快速运动时保住边缘刚进视野的 patch)。
-	var fmargin: float = float(fd.get("frustumMargin", 0.0))
+	var fmargin: float = float(fd.get("frustumMarginWorld", 0.0))
 	for i in range(6):
 		if i < frustum.size():
 			var p: Plane = frustum[i]
