@@ -99,9 +99,10 @@ var _frozen_frustum: Array = []
 var _cam_hist_valid := false
 var _last_cam_pos: Vector3 = Vector3.ZERO
 var _last_cam_fwd: Vector3 = Vector3.ZERO
-# 遮挡剔除的高度门控状态(带滞回, 避免在门限附近开关抖动)。
-var _occlusion_gate := true
-var _occlusion_applied := false   # 本帧 cull 是否实际应用了遮挡(经运动门后; 供 HUD 显示)
+var _occlusion_applied := false   # 本帧 cull 是否实际应用了遮挡(供 HUD 显示)
+# 相机模式(由 CameraDirector.set_cull_mode 推): true=CHARACTER(贴地聚焦角色 → 开 Hi-Z 遮挡),
+# false=PLANET(高空聚焦星球 → 关 Hi-Z, 靠地平线+视锥剔除, 避免绕球/拉近时 disocclusion 露洞)。
+var _cull_surface_mode: bool = true
 # Phase 6 方案 B: MultiMesh.visible_instance_count 门控。
 # 快速运动(尤其拉近)时可见 patch 数暴涨, 会超过滞后 frame_queue_size 帧的异步回读值 → 那几帧
 # visible_instance_count 偏小 → 露洞(一闪而过, 拉停自愈)。修法: 用相机运动这个**即时无滞后**的
@@ -230,26 +231,14 @@ func _process(_delta: float) -> void:
 		_vic_prev_cam_pos = cam_pos
 		_vic_prev_cam_fwd = vfwd
 		_vic_cam_hist = true
-	# 遮挡剔除高度门控(仅非冻结): 相机贴近地表时关遮挡(消除 disocclusion 黑洞), 远观时开(省算)。
-	# 带滞回(低于 thr 关, 高于 thr×1.5 才重开)→ 门限附近来回移动不会开关抖动。
-	if not _lod_frozen:
-		if p.occlusionMinAltitudeFrac > 0.0:
-			var altitude: float = maxf(cam_pos.distance_to(global_position) - p.radius, 0.0)
-			var thr: float = p.occlusionMinAltitudeFrac * p.radius
-			if altitude < thr:
-				_occlusion_gate = false
-			elif altitude > thr * 1.5:
-				_occlusion_gate = true
-			# thr ~ thr×1.5 之间: 保持上次状态(滞回)
-			occlusion_on = occlusion_on and _occlusion_gate
-		else:
-			_occlusion_gate = true
-	# occlusion_on 现在 = "想用遮挡"(用户开关 + 高度门); 金字塔照它每帧重建(set_active), 停下即用最新。
-	# 但 cull 里"是否应用"遮挡再加一道运动门: 快速运动时不应用 —— Hi-Z 用的是上一帧深度, 快速运动
-	# disocclusion(山背后新露出的地形被上一帧深度误判为遮挡)会露黑洞(用户实测确认)。相机稳定
-	# VIC_STABLE_FRAMES 帧后再应用(此时上一帧深度≈当前视野, 遮挡安全)。冻结时按冻结值应用(视角/深度都定格)。
-	var occlusion_apply: bool = occlusion_on if _lod_frozen else (occlusion_on and _stable_frames >= VIC_STABLE_FRAMES)
-	_occlusion_applied = occlusion_apply
+	# 遮挡剔除(Hi-Z)按相机模式选择性启用 —— 不同视角下有价值的剔除不同, 全开反而在不合适的模式添乱:
+	#   PLANET(高空聚焦星球, 绕球/拉近拉远): 关。地平线剔除已把行星背面剔干净, Hi-Z 额外收益极小, 却因
+	#     用上一帧深度在运动时 disocclusion(新露出地形被误判遮挡)露黑洞(用户实测)。关掉即无洞。
+	#   CHARACTER(贴地聚焦角色): 开(按 params.occlusionCulling)。贴地时近山遮挡后方地形, 正是 Hi-Z 的价值。
+	# 冻结时按冻结前的 params 值。注: 旧的高度门(occlusionMinAltitudeFrac)恰好反了 —— 贴地(最该开)关、
+	# 高空(最不该开)开, 故用模式门取代。occlusion_on 此处 = params.occlusionCulling。
+	var occlusion_want: bool = occlusion_on if (_lod_frozen or _cull_surface_mode) else false
+	_occlusion_applied = occlusion_want
 	# occluder 半径: minmax 就绪后是 radius+全局最小位移(_apply_minmax 设); 否则保守下界 radius-maxHeight。
 	var occluder_r: float = _occluder_radius if _occluder_radius > 0.0 else max(p.radius - p.maxHeight, 1.0)
 	_lod_comp.set_frame_data({
@@ -265,7 +254,7 @@ func _process(_delta: float) -> void:
 		"horizonCulling": horizon_on,
 		"horizonOccluderRadius": occluder_r,
 		"smallTriPixels": small_tri_px,
-		"occlusionCulling": occlusion_apply,
+		"occlusionCulling": occlusion_want,
 		"frustumMargin": frustum_margin,
 		"lod_frozen": _lod_frozen,
 	})
@@ -275,8 +264,8 @@ func _process(_delta: float) -> void:
 	#          于是遮挡剔除也定格在冻结视角, 旁观相机可绕看被遮挡剔除的洞。
 	#   遮挡关 → 不建。
 	if _hiz_comp != null:
-		# 金字塔照常每帧重建(不受运动门影响)→ 相机一停, cull 立刻能用到最新深度。
-		_hiz_comp.set_active(occlusion_on and not _lod_frozen)
+		# 金字塔只在会用到遮挡的模式(CHARACTER)重建; PLANET 模式关遮挡 → 不建, 省算。
+		_hiz_comp.set_active(occlusion_want and not _lod_frozen)
 	# minmax 未就绪时 cull 被跳过 → cull_tex 全 0 → vertex 坍缩无渲染(灰屏);
 	# 此时保持绑 fallback(20 面 Phase-1 风格), 让用户看到东西而不是空屏。
 	# 一旦 set_minmax 成功(下帧起), cull 写出有效 count, 切到 cull_tex 真正的 GPU LOD。
@@ -365,8 +354,15 @@ func get_lod_stats() -> Dictionary:
 	return {
 		"visible": rc, "submitted": _vic, "max": MAX_PATCHES,
 		"occlusion": p.occlusionCulling, "occlusion_applied": _occlusion_applied,
-		"horizon": p.horizonCulling,
+		"horizon": p.horizonCulling, "surface_mode": _cull_surface_mode,
 	}
+
+
+# CameraDirector 切换相机模式时调: 决定本模式下 Hi-Z 遮挡剔除是否启用(见 _process 的 occlusion_want)。
+#   surface=true  → CHARACTER 模式(贴地聚焦角色): 开遮挡(近山遮挡后方地形)。
+#   surface=false → PLANET 模式(高空聚焦星球): 关遮挡(靠地平线+视锥, 避免运动 disocclusion 露洞)。
+func set_cull_mode(surface: bool) -> void:
+	_cull_surface_mode = surface
 
 
 # 调试用(planet_lod_debug F3/F4): 运行时开关遮挡 / 地平线剔除, 快速定位"快速运动黑洞"来自哪种剔除。

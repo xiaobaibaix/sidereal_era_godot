@@ -61,6 +61,10 @@ func get_mode() -> int:
 
 func _apply_mode(instant := false) -> void:
 	var to_character := _mode == Mode.CHARACTER
+	# 按相机模式选择 GpuPlanet 剔除组合(尽早设 —— 切到 PLANET 时过渡期间就已关遮挡, 避免过渡运动露洞):
+	# CHARACTER(贴地)开 Hi-Z 遮挡; PLANET(高空)关遮挡(靠地平线+视锥, 无运动 disocclusion 洞)。
+	if planet != null:
+		planet.set_cull_mode(to_character)
 	# 把相机**重挂**到当前聚焦对象下: 角色模式 → 挂到角色; 星球模式 → 挂回星球。
 	# keep_global_transform=true → 世界位姿不变, 于是"聚焦谁相机就在谁身上"。
 	if orbit_camera != null:

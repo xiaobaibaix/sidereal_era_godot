@@ -59,13 +59,15 @@ func _update_hud() -> void:
 	var mx: int = int(s.get("max", 0))
 	var vis_txt: String = str(vis) if vis >= 0 else "…(回读未就绪)"
 	var occ: bool = bool(s.get("occlusion", false))          # 意愿开关(F3)
-	var occ_app: bool = bool(s.get("occlusion_applied", false))  # cull 实际是否应用(运动门后)
+	var occ_app: bool = bool(s.get("occlusion_applied", false))  # cull 实际是否应用(经模式门后)
 	var hor: bool = bool(s.get("horizon", false))
+	var surface: bool = bool(s.get("surface_mode", true))
+	var mode_txt: String = "CHARACTER(贴地)" if surface else "PLANET(高空)"
 	var occ_txt: String = "关"
 	if occ:
-		occ_txt = "开" if occ_app else "开(运动暂停)"   # 意愿开但运动中被门控暂停
-	_hud_label.text = "LOD 可见 patch: %s   提交 instance: %d / %d%s\n遮挡剔除(F3): %s   地平线剔除(F4): %s" % [
-		vis_txt, sub, mx, ("   [LOD 冻结]" if _frozen else ""),
+		occ_txt = "开" if occ_app else "开(此模式停用)"   # 意愿开但当前模式门控停用
+	_hud_label.text = "模式(M): %s   LOD 可见 patch: %s   提交 instance: %d / %d%s\n遮挡剔除(F3): %s   地平线剔除(F4): %s" % [
+		mode_txt, vis_txt, sub, mx, ("   [LOD 冻结]" if _frozen else ""),
 		occ_txt, ("开" if hor else "关")]
 
 
