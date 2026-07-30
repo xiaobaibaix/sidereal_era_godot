@@ -117,6 +117,7 @@ var _cam_pitch: float = -0.2
 var _cur_anim: String = ""
 var _cam_active: bool = false     # 本控制器当前是否在驱动相机(由 set_camera_active 切换)
 var _input_active: bool = false   # 角色是否响应键盘移动/跳跃(角色模式 true; 星球模式 false → WASD 不控制角色)
+var _input_suspended: bool = false  # 外部临时挂起输入(如 LOD 调试冻结: WASD 归旁观相机, 不能同时驱动角色)
 var _cam_snap: bool = false       # 接管相机后第一帧直接放到位(不 lerp), 避免从旧位置(可能在星球内)飞入
 var _cam_anchor_r: float = -1.0   # 平滑后的相机锚点"离球心半径"(消竖直颤抖); <0 = 未初始化
 var _cam_anchor_dir: Vector3 = Vector3.UP   # 平滑后的锚点方向(消 60Hz 物理步进造成的 look_at 朝向抽动)
@@ -283,17 +284,18 @@ func _update_movement(delta: float) -> void:
 		fwd_t = _project_on_tangent(-global_transform.basis.z)          # 无相机: 用当前朝向
 	var right_t := fwd_t.cross(_up).normalized()
 
-	# --- 输入 → 期望水平速度(仅角色模式响应键盘; 星球模式 _input_active=false → 不读 WASD, 角色静止贴地)---
+	# --- 输入 → 期望水平速度(仅角色模式且未被挂起时响应键盘; 否则不读 WASD, 角色静止贴地)---
+	var accepts: bool = _input_active and not _input_suspended
 	var iy := 0.0
 	var ix := 0.0
-	if _input_active:
+	if accepts:
 		iy = Input.get_action_strength("move_forward") - Input.get_action_strength("move_back")
 		ix = Input.get_action_strength("move_right") - Input.get_action_strength("move_left")
 	var wish := (right_t * ix + fwd_t * iy)
 	var moving := wish.length() > 0.05
 	if moving:
 		wish = wish.normalized()
-	var sprinting := _input_active and Input.is_physical_key_pressed(KEY_SHIFT)
+	var sprinting := accepts and Input.is_physical_key_pressed(KEY_SHIFT)
 	var target_speed := (run_speed if sprinting else walk_speed) if moving else 0.0
 	var target_v := wish * target_speed
 
@@ -304,7 +306,7 @@ func _update_movement(delta: float) -> void:
 	# --- 重力 / 跳跃(沿 up 的分量) ---
 	var g_mag := _gravity_vector().length()
 	_v_up -= g_mag * delta
-	if _input_active and _grounded and Input.is_action_just_pressed("jump"):
+	if accepts and _grounded and Input.is_action_just_pressed("jump"):
 		_v_up = jump_speed
 		_grounded = false
 
@@ -473,6 +475,13 @@ func get_follow_transform() -> Transform3D:
 
 func is_camera_active() -> bool:
 	return _cam_active
+
+
+## 临时挂起/恢复键盘输入(WASD/跳跃/加速), **不改动相机驱动状态**。
+## 用途: LOD 调试冻结(planet_lod_debug F2)期间 WASD 归旁观相机飞行, 不能同时驱动角色。
+## 与 set_camera_active 正交 —— 解冻后无需恢复模式, CameraDirector 的模式状态不受影响。
+func set_input_suspended(suspended: bool) -> void:
+	_input_suspended = suspended
 
 
 # ---- 内置第三人称相机(重力对齐, 独立朝向) ----

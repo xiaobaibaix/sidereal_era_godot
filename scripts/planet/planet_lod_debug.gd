@@ -81,6 +81,24 @@ func _find_gpu_planet(n: Node) -> GpuPlanet:
 	return null
 
 
+# 冻结期间挂起/恢复角色键盘输入(WASD 归旁观相机)。靠 has_method 鸭子类型查找, 不硬依赖角色脚本类型;
+# 场景里没有角色(纯星球测试场景)时静默跳过。
+func _suspend_character_input(suspended: bool) -> void:
+	var n: Node = _find_character(get_tree().root)
+	if n != null:
+		n.call("set_input_suspended", suspended)
+
+
+func _find_character(n: Node) -> Node:
+	if n.has_method("set_input_suspended"):
+		return n
+	for c in n.get_children():
+		var r: Node = _find_character(c)
+		if r != null:
+			return r
+	return null
+
+
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
 		if event.keycode == KEY_F1:
@@ -127,6 +145,8 @@ func _toggle_freeze() -> void:
 
 func _enter_freeze() -> void:
 	_gpu_planet.freeze_lod()
+	# 挂起角色键盘输入: 冻结期间 WASD 用来飞旁观相机, 否则会同时驱动角色(角色跑走 + 画面乱)。
+	_suspend_character_input(true)
 	# 建旁观相机, 初始位姿 = 当前 LOD 相机, 画面不跳变。
 	_spectator = Camera3D.new()
 	_spectator.name = "SpectatorCam"
@@ -148,6 +168,7 @@ func _enter_freeze() -> void:
 
 func _exit_freeze() -> void:
 	_gpu_planet.unfreeze_lod()
+	_suspend_character_input(false)   # 恢复角色键盘控制
 	if is_instance_valid(_lod_camera):
 		_lod_camera.current = true
 	if is_instance_valid(_spectator):
