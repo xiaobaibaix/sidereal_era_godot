@@ -94,6 +94,11 @@ var _mutex := Mutex.new()
 var _frame_data: Dictionary = {}
 var _ready := false
 
+# Phase 6 方案 B: 异步回读的可见 patch 数(-1 = 未就绪 → 主线程降级为不裁剪, 安全)。
+# 回调可能在渲染线程触发, 用 _mutex 保护。
+var _visible_count: int = -1
+var _readback_warned := false
+
 
 func _init() -> void:
 	effect_callback_type = CompositorEffect.EFFECT_CALLBACK_TYPE_PRE_OPAQUE
@@ -103,15 +108,16 @@ func _init() -> void:
 
 func _notification(what: int) -> void:
 	if what == NOTIFICATION_PREDELETE:
-		_free_res(_trav_shader)
-		_free_res(_cull_shader)
-		_free_res(_lodtex_shader)
-		_trav_shader = RID()
-		_cull_shader = RID()
-		_lodtex_shader = RID()
-		_trav_pipeline = RID()
-		_cull_pipeline = RID()
-		_lodtex_pipeline = RID()
+		if _rd == null:
+			_rd = RenderingServer.get_rendering_device()
+		if _rd == null:
+			return   # RenderingDevice 已随引擎/场景先行析构; RID 由其自身回收, 无需(也不能)再 free。
+		_ready = false
+		# 释放顺序关键(见 Godot issue #103073: free_rid 级联释放关联 RID; UniformSetCacheRD 用
+		# uniform_set_set_invalidation_callback 登记失效回调): 先放纹理/缓冲/采样器/UBO(此时引用它们的
+		# uniform set 仍在, free 触发的失效回调能干净移除缓存条目), 再放 shader(级联清由该 shader 建的
+		# set)。反序(先放 shader)会让后续纹理 free 的失效回调拿到已删的 set → "Parameter us is null" /
+		# "not a valid texture" 报错。
 		for i in range(2):
 			_free_res(_trav_tex[i]); _trav_tex[i] = RID()
 			_free_res(_trav_counter[i]); _trav_counter[i] = RID()
@@ -124,7 +130,9 @@ func _notification(what: int) -> void:
 		_free_res(_adjacency_buf); _adjacency_buf = RID()
 		_free_res(_hiz_dummy_tex); _hiz_dummy_tex = RID()
 		_free_res(_hiz_sampler); _hiz_sampler = RID()
-		_ready = false
+		_free_res(_trav_shader); _trav_shader = RID(); _trav_pipeline = RID()
+		_free_res(_cull_shader); _cull_shader = RID(); _cull_pipeline = RID()
+		_free_res(_lodtex_shader); _lodtex_shader = RID(); _lodtex_pipeline = RID()
 
 
 static func _free_res(rid: RID) -> void:
@@ -253,6 +261,37 @@ func get_read_texture(write_idx: int) -> Texture2DRD:
 # GpuPlanet 应继续绑 fallback 纹理(否则 shader 读到 count=0 → 坍缩无渲染 → 灰屏)。
 func is_minmax_ready() -> bool:
 	return _minmax_ready
+
+
+# ---- Phase 6 方案 B: 可见 patch 数异步回读(消除空 instance 顶点开销) ----
+# _render_callback 里发起: 读本帧 cull_counter(atomicAdd 的可见 patch 数)。async → 不 stall GPU,
+# RD 在 frame_queue_size 帧后调 _on_visible_count_readback。失败(某后端不支持)→ _visible_count 保持
+# -1 → 主线程降级为不裁剪(等价旧行为, 正确无洞)。
+func _request_visible_count_readback(write_idx: int) -> void:
+	if _rd == null or not _cull_counter[write_idx].is_valid():
+		return
+	var err: Error = _rd.buffer_get_data_async(_cull_counter[write_idx], _on_visible_count_readback, 0, 4)
+	if err != OK and not _readback_warned:
+		_readback_warned = true
+		push_warning("[GpuLodCompositor] buffer_get_data_async 失败(err=%d); visible_instance_count 降级为不裁剪(无优化但正确)" % err)
+
+
+# RD 回调(frame_queue_size 帧后, 可能在渲染线程)。存 mutex 保护变量供主线程 get_visible_count 读。
+func _on_visible_count_readback(bytes: PackedByteArray) -> void:
+	if bytes.size() < 4:
+		return
+	var c: int = int(bytes.decode_u32(0))
+	_mutex.lock()
+	_visible_count = c
+	_mutex.unlock()
+
+
+# 主线程(GpuPlanet._process)调: 返回最近回读的可见 patch 数; -1 = 未就绪(主线程应降级不裁剪)。
+func get_visible_count() -> int:
+	_mutex.lock()
+	var c: int = _visible_count
+	_mutex.unlock()
+	return c
 
 
 func _compile_traverse() -> bool:
@@ -461,12 +500,18 @@ func _render_callback(_effect_callback_type: int, render_data: RenderData) -> vo
 		_dispatch_cull(write_idx, -1, 1)                # reset cull_counter
 		_dispatch_cull(write_idx, 0, _cull_groups())     # cull dispatch
 		_dispatch_cull(write_idx, -2, 1)                # cull metadata: count → cull_tex META_ROW
+		# Phase 6 方案 B: 异步回读本帧可见 patch 数(延迟 frame_queue_size 帧, 不 stall GPU) →
+		# 主线程据此设 MultiMesh.visible_instance_count, 砍掉空 instance 的顶点 shader 开销。
+		# 冻结时不回读(主线程冻结路径直接设 MAX_PATCHES, 见 gpu_planet._apply_visible_count)。
+		if not bool(fd.get("lod_frozen", false)):
+			_request_visible_count_readback(write_idx)
 
 
 # 把 frame_data 打包进 _frame_ubo(std140, 144 字节)。
 func _update_frame_ubo(fd: Dictionary) -> void:
 	var floats := PackedFloat32Array()
-	floats.resize(FRAME_UBO_SIZE / 4)   # 36 floats
+	@warning_ignore("integer_division")
+	floats.resize(FRAME_UBO_SIZE / 4)   # 240 字节 / 4 = 60 floats
 	# frustum[6]: Godot Camera3D.get_frustum() 返回**外向法线** N(指向视锥外),
 	# Godot Plane 存 d = dot(N, p_on_plane), 平面方程 dot(N,P)=d。
 	# 外向 N 下: 视锥内 dot(N,P) < d, 视锥外 dot(N,P) > d。
@@ -701,6 +746,7 @@ func _dispatch_lodtex(write_idx: int, mode: int, groups: int) -> void:
 
 # reset 组数: 20 face × 64×64 = 81920 cells / 64 = 1280 workgroup
 func _lodtex_reset_groups() -> int:
+	@warning_ignore("integer_division")
 	return (GpuIco.FACE_COUNT * LODTEX_RES * LODTEX_RES + WG - 1) / WG
 
 

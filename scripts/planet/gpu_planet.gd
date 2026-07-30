@@ -101,6 +101,9 @@ var _last_cam_pos: Vector3 = Vector3.ZERO
 var _last_cam_fwd: Vector3 = Vector3.ZERO
 # 遮挡剔除的高度门控状态(带滞回, 避免在门限附近开关抖动)。
 var _occlusion_gate := true
+# Phase 6 方案 B: 当前应用的 visible_instance_count(渐降平滑, 防抖 + 防回读滞后露洞)。
+# 回读的可见 patch 数 + 安全余量驱动; 未就绪/冻结/编辑器预览关时 = MAX_PATCHES(不裁剪)。
+var _vic: int = MAX_PATCHES
 
 
 func _ready() -> void:
@@ -139,6 +142,7 @@ func _process(_delta: float) -> void:
 	# 编辑器预览关: compositor 已被 _apply_preview_enabled 禁用; 绑 fallback(基础 20 面)避免读到空 cull_tex。
 	if Engine.is_editor_hint() and not preview_in_editor:
 		_mat.set_shader_parameter("u_patchTex", _patch_tex_fallback)
+		_apply_visible_count(false)   # 不裁剪(fallback 20 面须全可见)
 		return
 	var p: PlanetParams = _effective_params()
 	var write_idx: int = _frame & 1
@@ -241,7 +245,8 @@ func _process(_delta: float) -> void:
 	# minmax 未就绪时 cull 被跳过 → cull_tex 全 0 → vertex 坍缩无渲染(灰屏);
 	# 此时保持绑 fallback(20 面 Phase-1 风格), 让用户看到东西而不是空屏。
 	# 一旦 set_minmax 成功(下帧起), cull 写出有效 count, 切到 cull_tex 真正的 GPU LOD。
-	if _lod_comp.is_minmax_ready():
+	var use_gpu_lod: bool = _lod_comp.is_minmax_ready()
+	if use_gpu_lod:
 		_mat.set_shader_parameter("u_patchTex", _lod_comp.get_read_texture(write_idx))
 		if _frame == 1:
 			print("[GpuPlanet] minmax ready → bind cull_tex (GPU LOD active)")
@@ -249,7 +254,40 @@ func _process(_delta: float) -> void:
 		_mat.set_shader_parameter("u_patchTex", _patch_tex_fallback)
 		if _frame == 1:
 			print("[GpuPlanet] minmax NOT ready → bind fallback (20 面). 检查 set_minmax 是否失败")
+	# Phase 6 方案 B: GPU LOD 激活且未冻结时, 用回读的可见 patch 数设 visible_instance_count。
+	# 冻结时不裁剪(旁观相机要看冻结视角被剔成什么样, 且 count 回读路径已停)。
+	_apply_visible_count(use_gpu_lod and not _lod_frozen)
 	_frame += 1
+
+
+# Phase 6 方案 B: 按回读的可见 patch 数设 MultiMesh.visible_instance_count, 砍掉空 instance 的
+# 顶点 shader 开销。现状: 提交 MAX_PATCHES=12288 个 instance, vertex 靠 META_ROW count 把 id≥count
+# 的坍缩成退化点(rasterizer 丢弃), 但坍缩前每个空 instance 的顶点 shader 仍全跑。可见通常仅几百 →
+# 上万空 instance 白跑顶点 shader。设 visible_instance_count 让 GPU 干脆不提交它们。
+#
+# 正确性: vertex 的 META_ROW 坍缩守卫仍在 → visible_instance_count 只是"上限优化", 过大无害
+# (多出的 instance 坍缩丢弃), 过小才会把有效 patch 裁掉露洞。回读延迟 frame_queue_size 帧, 故:
+#   ① 带安全余量(×1.5 + 256)覆盖回读窗口内 patch 数增长; ② 增长立即跟上、收缩缓降, 防露洞防抖。
+#   apply=false(编辑器预览关 / minmax 未就绪 / 冻结) 或 回读未就绪(rc<0) → MAX_PATCHES(不裁剪, 安全降级)。
+func _apply_visible_count(apply: bool) -> void:
+	if _mm == null:
+		return
+	var target: int
+	if not apply:
+		target = MAX_PATCHES
+	else:
+		var rc: int = _lod_comp.get_visible_count()
+		if rc < 0:
+			target = MAX_PATCHES   # 回读未就绪(前几帧 / 后端不支持 async) → 不裁剪
+		else:
+			target = clampi(int(ceil(float(rc) * 1.5)) + 256, 0, MAX_PATCHES)
+	# 增长立即跟上(安全方向: 过量 instance 坍缩无害); 收缩缓降(~12.5%/帧, 至少 64), 防抖 + 防回读滞后露洞。
+	if target >= _vic:
+		_vic = target
+	else:
+		_vic = maxi(target, _vic - maxi(64, int(float(_vic - target) / 8.0)))
+	if _mm.visible_instance_count != _vic:
+		_mm.visible_instance_count = _vic
 
 
 # ---- LOD 冻结接口(供 planet_lod_debug.gd 调; 调试用) ----
@@ -278,6 +316,15 @@ func unfreeze_lod() -> void:
 
 func is_lod_frozen() -> bool:
 	return _lod_frozen
+
+
+# 调试用(planet_lod_debug HUD): 返回 LOD 提交统计, 验证 Phase 6 方案 B 生效。
+#   visible   = 最近回读的可见 patch 数(-1 = 未就绪)
+#   submitted = 当前 MultiMesh.visible_instance_count(= 实际提交 GPU 的 instance 数)
+#   max       = MAX_PATCHES(未优化时的提交数)
+func get_lod_stats() -> Dictionary:
+	var rc: int = _lod_comp.get_visible_count() if _lod_comp != null else -1
+	return {"visible": rc, "submitted": _vic, "max": MAX_PATCHES}
 
 
 # 切换单遍着色器线框(F1 用)。不走 DEBUG_DRAW_WIREFRAME(那会额外 line pass, 12288 instance 爆帧)。

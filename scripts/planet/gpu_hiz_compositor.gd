@@ -46,11 +46,37 @@ func _init() -> void:
 
 
 func _notification(what: int) -> void:
-	if what == NOTIFICATION_PREDELETE:
-		_free_res(_copy_shader); _copy_shader = RID(); _copy_pipeline = RID()
-		_free_res(_reduce_shader); _reduce_shader = RID(); _reduce_pipeline = RID()
-		_free_res(_depth_sampler); _depth_sampler = RID()
-		_free_pyramid()
+	if what != NOTIFICATION_PREDELETE:
+		return
+	# 用缓存的 _rd(镜像 atmosphere_compositor 的稳妥写法); 引擎/场景关闭时 RD 可能已析构。
+	if _rd == null:
+		return
+	# 全部 inline 释放, 不调用任何实例方法(如 _free_pyramid): PREDELETE 时本实例正在析构, 调用自身
+	# 脚本方法会报 "Attempt to call function '_free_pyramid' ... on a null instance"(报错栈里的
+	# gpu_hiz_compositor.gd:60 @ _free_pyramid 即此), 随后纹理/uniform_set 的连锁报错都是它的余波。
+	# atmosphere_compositor 全程 inline + _rd.free_rid + is_valid 守卫, 稳妥无报错, 这里照搬。
+	# 先放 mip slice view(texture_create_shared_from_slice 建的关联 RID), 再放父纹理 _pyr_tex。
+	for v in _mip_views:
+		if v.is_valid():
+			_rd.free_rid(v)
+	_mip_views = []
+	if _pyr_tex.is_valid():
+		_rd.free_rid(_pyr_tex)
+	_pyr_tex = RID()
+	_size = Vector2i.ZERO
+	_mip_count = 0
+	_ready = false
+	if _depth_sampler.is_valid():
+		_rd.free_rid(_depth_sampler)
+	_depth_sampler = RID()
+	if _copy_shader.is_valid():
+		_rd.free_rid(_copy_shader)   # 连带释放 pipeline(RD 做依赖追踪)
+	_copy_shader = RID()
+	_copy_pipeline = RID()
+	if _reduce_shader.is_valid():
+		_rd.free_rid(_reduce_shader)
+	_reduce_shader = RID()
+	_reduce_pipeline = RID()
 
 
 static func _free_res(rid: RID) -> void:

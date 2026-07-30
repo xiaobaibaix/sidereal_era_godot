@@ -22,6 +22,9 @@ var _spec_yaw: float = 0.0
 var _spec_pitch: float = 0.0
 var _speed_mult: float = 1.0
 
+var _hud_layer: CanvasLayer   # LOD 统计 HUD(验证 Phase 6 方案 B: 提交 instance 数应远小于 MAX_PATCHES)
+var _hud_label: Label
+
 
 func _ready() -> void:
 	_gpu_planet = _find_gpu_planet(get_tree().root)
@@ -29,6 +32,34 @@ func _ready() -> void:
 		_lod_camera = _gpu_planet.camera
 	else:
 		push_warning("[LODDebug] 未找到 GpuPlanet 节点, F2 冻结不可用")
+	_build_hud()
+
+
+# LOD 统计 HUD: 显示回读的可见 patch 数 + 实际提交的 instance 数。
+# Phase 6 方案 B 生效时"提交"应从 MAX_PATCHES(12288)降到 可见 patch 数 + 余量。
+func _build_hud() -> void:
+	_hud_layer = CanvasLayer.new()
+	add_child(_hud_layer)
+	_hud_label = Label.new()
+	_hud_label.position = Vector2(8, 44)   # 避开 fps.tscn 的 FPS Label(在 y=8)
+	_hud_label.add_theme_font_size_override("font_size", 16)
+	_hud_label.add_theme_color_override("font_color", Color.WHITE)
+	_hud_label.add_theme_color_override("font_shadow_color", Color.BLACK)
+	_hud_label.add_theme_constant_override("shadow_offset_x", 1)
+	_hud_label.add_theme_constant_override("shadow_offset_y", 1)
+	_hud_layer.add_child(_hud_label)
+
+
+func _update_hud() -> void:
+	if _hud_label == null or _gpu_planet == null:
+		return
+	var s: Dictionary = _gpu_planet.get_lod_stats()
+	var vis: int = int(s.get("visible", -1))
+	var sub: int = int(s.get("submitted", 0))
+	var mx: int = int(s.get("max", 0))
+	var vis_txt: String = str(vis) if vis >= 0 else "…(回读未就绪)"
+	_hud_label.text = "LOD 可见 patch: %s   提交 instance: %d / %d%s" % [
+		vis_txt, sub, mx, ("   [LOD 冻结]" if _frozen else "")]
 
 
 func _find_gpu_planet(n: Node) -> GpuPlanet:
@@ -120,6 +151,7 @@ func _apply_spectator_rotation() -> void:
 
 
 func _process(delta: float) -> void:
+	_update_hud()
 	if not _frozen or not is_instance_valid(_spectator):
 		return
 	var input := Vector3.ZERO
