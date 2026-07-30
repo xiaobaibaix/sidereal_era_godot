@@ -100,6 +100,12 @@ var _cam_hist_valid := false
 var _last_cam_pos: Vector3 = Vector3.ZERO
 var _last_cam_fwd: Vector3 = Vector3.ZERO
 var _occlusion_applied := false   # 本帧 cull 是否实际应用了遮挡(供 HUD 显示)
+# 遮挡剔除算法(F3 循环切换, 供对比):
+#   1 = Hi-Z 屏幕空间(上一帧深度金字塔; 有 1 帧延迟 → 快速运动会 disocclusion 黑洞)
+#   2 = 解析地形射线(方案 B; 只用当前帧相机 + 静态烘焙 MinMax → 构造上无延迟, 不产生黑洞)
+const OCCL_MODE_HIZ := 1
+const OCCL_MODE_RAY := 2
+var _occl_mode: int = OCCL_MODE_RAY   # 默认用方案 B(无黑洞)
 # 相机模式(由 CameraDirector.set_cull_mode 推): true=CHARACTER(贴地聚焦角色 → 开 Hi-Z 遮挡),
 # false=PLANET(高空聚焦星球 → 关 Hi-Z, 靠地平线+视锥剔除, 避免绕球/拉近时 disocclusion 露洞)。
 var _cull_surface_mode: bool = true
@@ -247,7 +253,8 @@ func _process(_delta: float) -> void:
 		"horizonCulling": horizon_on,
 		"horizonOccluderRadius": occluder_r,
 		"smallTriPixels": small_tri_px,
-		"occlusionCulling": occlusion_want,
+		# 传**模式值**(0=关, 1=Hi-Z, 2=解析射线), 不是 bool —— shader 按它选算法。
+		"occlusionCulling": (float(_occl_mode) if occlusion_want else 0.0),
 		"frustumMargin": frustum_margin,
 		"lod_frozen": _lod_frozen,
 	})
@@ -257,8 +264,9 @@ func _process(_delta: float) -> void:
 	#          于是遮挡剔除也定格在冻结视角, 旁观相机可绕看被遮挡剔除的洞。
 	#   遮挡关 → 不建。
 	if _hiz_comp != null:
-		# 金字塔只在会用到遮挡的模式(CHARACTER)重建; PLANET 模式关遮挡 → 不建, 省算。
-		_hiz_comp.set_active(occlusion_want and not _lod_frozen)
+		# 金字塔只在**真正用 Hi-Z 的模式**才重建: CHARACTER 模式 + 遮挡开 + mode==Hi-Z。
+		# 方案 B(解析射线)不需要深度金字塔 → 不建, 省掉每帧 copy+reduce 的开销。
+		_hiz_comp.set_active(occlusion_want and _occl_mode == OCCL_MODE_HIZ and not _lod_frozen)
 	# minmax 未就绪时 cull 被跳过 → cull_tex 全 0 → vertex 坍缩无渲染(灰屏);
 	# 此时保持绑 fallback(20 面 Phase-1 风格), 让用户看到东西而不是空屏。
 	# 一旦 set_minmax 成功(下帧起), cull 写出有效 count, 切到 cull_tex 真正的 GPU LOD。
@@ -347,7 +355,7 @@ func get_lod_stats() -> Dictionary:
 	var p: PlanetParams = _effective_params()
 	return {
 		"visible": rc, "submitted": _vic, "max": MAX_PATCHES,
-		"occlusion": p.occlusionCulling, "occlusion_applied": _occlusion_applied,
+		"occlusion_text": occlusion_mode_text(),
 		"horizon": p.horizonCulling, "surface_mode": _cull_surface_mode,
 	}
 
@@ -361,10 +369,30 @@ func set_cull_mode(surface: bool) -> void:
 
 # 调试用(planet_lod_debug F3/F4): 运行时开关遮挡 / 地平线剔除, 快速定位"快速运动黑洞"来自哪种剔除。
 # 剔除跑在上一帧数据上(1 帧延迟), 快速运动时被剔集合滞后 → 露洞。逐个关掉即可定位元凶。
-func debug_toggle_occlusion() -> bool:
+## F3 循环切换遮挡: 关 → Hi-Z(屏幕空间, 1 帧延迟) → 解析地形射线(方案 B, 无延迟) → 关。
+## 返回当前状态字符串, 供调试 HUD/日志显示。方便直接对比两种算法的黑洞与剔除量。
+func debug_cycle_occlusion() -> String:
 	var p: PlanetParams = _effective_params()
-	p.occlusionCulling = not p.occlusionCulling
-	return p.occlusionCulling
+	if not p.occlusionCulling:
+		p.occlusionCulling = true
+		_occl_mode = OCCL_MODE_HIZ
+	elif _occl_mode == OCCL_MODE_HIZ:
+		_occl_mode = OCCL_MODE_RAY
+	else:
+		p.occlusionCulling = false
+	return occlusion_mode_text()
+
+
+## 当前遮挡状态文字(HUD 用)。
+func occlusion_mode_text() -> String:
+	var p: PlanetParams = _effective_params()
+	if not p.occlusionCulling:
+		return "关"
+	# 不用局部变量名 name —— 会遮蔽 Node.name 触发 SHADOWED_VARIABLE 警告。
+	var algo: String = "Hi-Z(1帧延迟)" if _occl_mode == OCCL_MODE_HIZ else "解析射线(无延迟)"
+	if not _occlusion_applied:
+		return algo + "[此模式停用]"   # 意愿开但当前相机模式(PLANET)不启用
+	return algo
 
 
 func debug_toggle_horizon() -> bool:

@@ -202,6 +202,78 @@ bool _occluded_hiz(vec3 pts[12]) {
 	return z_near < hz;
 }
 
+// ---- Phase 6 方案 B: 解析式地形射线遮挡(根除 disocclusion 黑洞) ----
+// 与 Hi-Z 的本质区别: **只用当前帧相机 + 静态烘焙高度场, 不用任何跨帧数据** → 构造上不存在
+// "用上一帧深度决定这一帧可见性"的问题 → 不产生 disocclusion 黑洞。
+//
+// 判据: 沿"相机 → patch 点"线段步进, 查该处地形的**最小**高度 minH(烘焙 MinMax 的 R 通道)。
+// 若线段在某处的半径 < radius + minH, 则线段位于该处地形的**下界之下** → 地形【确定】挡住 → 可剔。
+// 用 minH(下界)而非 maxH 是保守性的关键: 实际地形 ≥ minH, 所以"低于 minH"必然被挡, 不会误剔。
+
+// 球面方向 d → 所属 ico 面 + face-bary。找到返回 face index 并写 uv; 找不到返回 -1。
+int _dir_to_face_bary(vec3 d, out vec2 uv) {
+	for (int f = 0; f < FACE_COUNT; f++) {
+		vec3 A = normalize(RAW_VERTS[FACES[f * 3]]);
+		vec3 B = normalize(RAW_VERTS[FACES[f * 3 + 1]]);
+		vec3 C = normalize(RAW_VERTS[FACES[f * 3 + 2]]);
+		// 球面三角内测试(与绕序无关): 三个大圆平面的符号一致即在内部。
+		float s0 = dot(d, cross(A, B));
+		float s1 = dot(d, cross(B, C));
+		float s2 = dot(d, cross(C, A));
+		bool inside = (s0 >= -1e-6 && s1 >= -1e-6 && s2 >= -1e-6)
+			|| (s0 <= 1e-6 && s1 <= 1e-6 && s2 <= 1e-6);
+		if (!inside) {
+			continue;
+		}
+		// 精确投影: 射线 origin→d 与平面 ABC 的交点, 再在平面内解 bary(比直接用 d 解更准)。
+		vec3 n = cross(B - A, C - A);
+		float dn = dot(d, n);
+		if (abs(dn) < 1e-12) {
+			continue;
+		}
+		vec3 P = d * (dot(A, n) / dn);
+		vec3 AB = B - A;
+		vec3 AC = C - A;
+		vec3 AP = P - A;
+		float a11 = dot(AB, AB);
+		float a12 = dot(AB, AC);
+		float a22 = dot(AC, AC);
+		float b1 = dot(AP, AB);
+		float b2 = dot(AP, AC);
+		float det = a11 * a22 - a12 * a12;
+		if (abs(det) < 1e-12) {
+			continue;
+		}
+		uv = vec2((a22 * b1 - a12 * b2) / det, (a11 * b2 - a12 * b1) / det);
+		return f;
+	}
+	uv = vec2(0.0);
+	return -1;
+}
+
+// 线段 cam→P 是否被地形确定挡住。mip 越粗 → minH 越小 → 越难判定被挡 → 越保守(宁可漏剔不误剔)。
+bool _blocked_by_terrain(vec3 P, vec3 cam, vec3 center, float radius, float mip) {
+	const int STEPS = 16;
+	for (int i = 1; i < STEPS; i++) {
+		vec3 S = mix(cam, P, float(i) / float(STEPS));
+		vec3 rel = S - center;
+		float r_S = length(rel);
+		if (r_S < 1e-4) {
+			continue;
+		}
+		vec2 uv;
+		int f = _dir_to_face_bary(rel / r_S, uv);
+		if (f < 0 || uv.x < 0.0 || uv.y < 0.0 || uv.x + uv.y > 1.0) {
+			continue;   // 落在面外(数值边界) → 跳过, 不判被挡(保守)
+		}
+		float minH = textureLod(minmax_tex, vec3(uv, float(f)), mip).r;
+		if (r_S < radius + minH) {
+			return true;   // 线段低于该处地形下界 → 确定被挡
+		}
+	}
+	return false;
+}
+
 void main() {
 	// ---- 特殊模式: reset / metadata(单线程, 与 lod_traverse 同模式) ----
 	if (pc.mode < 0) {
@@ -315,24 +387,43 @@ void main() {
 		}
 	}
 
-	// ---- Phase 5: Hi-Z 遮挡剔除(上一帧深度金字塔; ready 门控) ----
-	// 用 patch 自身 12 点(不是世界 AABB 的 8 角, 见 _occluded_hiz 注释): 3 角点 + 3 边中点(球面三角
-	// 的鼓出处), 各取 minH/maxH 两个径向位移 → 完整包住 patch 但远比 AABB 紧。
-	if (!sentinel && fd.cull_params.w > 0.5 && fd.hiz_params.w > 0.5) {
+	// ---- 遮挡剔除。cull_params.w = 模式: 0=关, 1=Hi-Z(屏幕空间, 有 1 帧延迟), 2=解析地形射线(无延迟) ----
+	if (!sentinel && fd.cull_params.w > 0.5) {
 		vec3 mAB = normalize(A + B);
 		vec3 mBC = normalize(B + C);
 		vec3 mCA = normalize(C + A);
 		float r_lo = radius + minH;
 		float r_hi = radius + maxH;
-		vec3 pts[12];
-		pts[0] = A_min;  pts[1] = A_max;
-		pts[2] = B_min;  pts[3] = B_max;
-		pts[4] = C_min;  pts[5] = C_max;
-		pts[6] = center + mAB * r_lo;  pts[7] = center + mAB * r_hi;
-		pts[8] = center + mBC * r_lo;  pts[9] = center + mBC * r_hi;
-		pts[10] = center + mCA * r_lo; pts[11] = center + mCA * r_hi;
-		if (_occluded_hiz(pts)) {
-			return;
+		if (fd.cull_params.w < 1.5) {
+			// 模式 1: Hi-Z。用 patch 自身 12 点(不是世界 AABB 的 8 角, 见 _occluded_hiz 注释):
+			// 3 角点 + 3 边中点(球面三角的鼓出处), 各取 minH/maxH → 完整包住 patch 但远比 AABB 紧。
+			if (fd.hiz_params.w > 0.5) {
+				vec3 pts[12];
+				pts[0] = A_min;  pts[1] = A_max;
+				pts[2] = B_min;  pts[3] = B_max;
+				pts[4] = C_min;  pts[5] = C_max;
+				pts[6] = center + mAB * r_lo;  pts[7] = center + mAB * r_hi;
+				pts[8] = center + mBC * r_lo;  pts[9] = center + mBC * r_hi;
+				pts[10] = center + mCA * r_lo; pts[11] = center + mCA * r_hi;
+				if (_occluded_hiz(pts)) {
+					return;
+				}
+			}
+		} else {
+			// 模式 2: 解析地形射线(方案 B)。只测 **maxH 处** 的 6 点(3 角 + 3 边中): 同方向上半径越高
+			// 越容易越过山脊被看见, 所以"最高点都被挡" ⇒ 其下方各点也被挡 → 测最高点即保守充分。
+			// 任一点未被挡 → patch 可能可见 → 立即不剔(早退, 可见 patch 的常见路径也最省)。
+			// mip 取 2(min over 4×4 cell): 比 mip0(单点采样, 不严格包夹)更保守, 抗实时噪声偏差。
+			float mip_occ = min(2.0, fd.consts.x);
+			vec3 cam_w = fd.cam_pos_pad.xyz;
+			if (_blocked_by_terrain(center + A * r_hi, cam_w, center, radius, mip_occ)
+					&& _blocked_by_terrain(center + B * r_hi, cam_w, center, radius, mip_occ)
+					&& _blocked_by_terrain(center + C * r_hi, cam_w, center, radius, mip_occ)
+					&& _blocked_by_terrain(center + mAB * r_hi, cam_w, center, radius, mip_occ)
+					&& _blocked_by_terrain(center + mBC * r_hi, cam_w, center, radius, mip_occ)
+					&& _blocked_by_terrain(center + mCA * r_hi, cam_w, center, radius, mip_occ)) {
+				return;
+			}
 		}
 	}
 

@@ -63,14 +63,10 @@ func _update_hud() -> void:
 	var sub: int = int(s.get("submitted", 0))
 	var mx: int = int(s.get("max", 0))
 	var vis_txt: String = str(vis) if vis >= 0 else "…(回读未就绪)"
-	var occ: bool = bool(s.get("occlusion", false))          # 意愿开关(F3)
-	var occ_app: bool = bool(s.get("occlusion_applied", false))  # cull 实际是否应用(经模式门后)
+	var occ_txt: String = String(s.get("occlusion_text", "?"))
 	var hor: bool = bool(s.get("horizon", false))
 	var surface: bool = bool(s.get("surface_mode", true))
 	var mode_txt: String = "CHARACTER(贴地)" if surface else "PLANET(高空)"
-	var occ_txt: String = "关"
-	if occ:
-		occ_txt = "开" if occ_app else "开(此模式停用)"   # 意愿开但当前模式门控停用
 	_hud_label.text = "模式(M): %s   LOD 可见 patch: %s   提交 instance: %d / %d%s\n遮挡剔除(F3): %s   地平线剔除(F4): %s" % [
 		mode_txt, vis_txt, sub, mx, ("   [LOD 冻结]" if _frozen else ""),
 		occ_txt, ("开" if hor else "关")]
@@ -112,7 +108,8 @@ func _unhandled_input(event: InputEvent) -> void:
 			_toggle_freeze()
 		elif event.keycode == KEY_F3:
 			if _gpu_planet != null:
-				print("[LODDebug] 遮挡剔除(Hi-Z): %s" % ("开" if _gpu_planet.debug_toggle_occlusion() else "关"))
+				# 循环: 关 → Hi-Z(屏幕空间, 1 帧延迟) → 解析地形射线(方案 B, 无延迟) → 关
+				print("[LODDebug] 遮挡剔除: %s" % _gpu_planet.debug_cycle_occlusion())
 		elif event.keycode == KEY_F4:
 			if _gpu_planet != null:
 				print("[LODDebug] 地平线剔除: %s" % ("开" if _gpu_planet.debug_toggle_horizon() else "关"))

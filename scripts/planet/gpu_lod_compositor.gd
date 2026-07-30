@@ -569,8 +569,8 @@ func _update_frame_ubo(fd: Dictionary) -> void:
 	floats[36] = 1.0 if bool(fd.get("horizonCulling", false)) else 0.0
 	floats[37] = float(fd.get("horizonOccluderRadius", float(fd["radius"])))
 	floats[38] = float(fd.get("smallTriPixels", 0.0))
-	# 遮挡开关: 需 provider 开 + 本帧金字塔就绪(hiz_ready)才真正跑; enable 仅表用户意愿。
-	floats[39] = 1.0 if bool(fd.get("occlusionCulling", false)) else 0.0
+	# 遮挡**模式**(不是 bool): 0=关, 1=Hi-Z(需金字塔就绪 hiz_ready 才真跑), 2=解析地形射线(无需金字塔)。
+	floats[39] = float(fd.get("occlusionCulling", 0.0))
 	# Phase 5 hiz_params: x=hiz_w, y=hiz_h, z=hiz_mip_count, w=hiz_ready
 	if not _hiz_info.is_empty():
 		floats[40] = float(_hiz_info.get("width", 1))
