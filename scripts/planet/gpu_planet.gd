@@ -96,6 +96,10 @@ var _frame: int = 0   # 双缓冲帧计数(GpuPlanet 主线程拥有; 决定 com
 # 切 GPU LOD。
 # 为什么用 group task 而不是"单个 add_task 里再 add_group_task + wait": 后者是在 worker 线程里等
 # 另一组 worker, 有死锁隐患; 直接由主线程发起 group、每帧轮询 is_group_task_completed 最干净。
+# 已上传到 GPU 的那份 MinMax 对应的 seed_hash, 供 _bake_and_push_minmax 幂等守卫用。
+# 用独立 bool 而不是拿 0 / -1 当哨兵: String.hash() 可以返回任意 int, 包括 0。
+var _applied_seed_hash: int = 0
+var _has_applied_minmax: bool = false
 var _bake_group_id: int = -1
 var _bake_result: GpuMinMaxData     # group task 期间由 worker 并发写 face_mip0[fi](各写各的, 无锁)
 var _bake_terrain: Terrain          # 共享只读噪声实例(height_at 不写成员 → 并发安全)
@@ -448,6 +452,14 @@ func _bake_and_push_minmax() -> void:
 		return
 	var p: PlanetParams = _effective_params()
 	var sh: int = HeightmapBaker.compute_seed_hash(p)
+	# 幂等守卫: param_changed 对**任何** PlanetParams 属性都会来(线框/遮挡剔除/地平线开关这些纯
+	# 渲染项也算), 而 MinMax 只依赖 seed_hash 里那批噪声参数。不比一下, 每按一次调试键都要
+	# load .res + 重建金字塔 + 重建 GPU 纹理 + 20 次 texture_update —— 日志里能看到十几次
+	# "缓存命中"连着刷。
+	# 用 hash 比较而不是维护一份 key 白名单: compute_seed_hash 是唯一数据源, 不会漂移;
+	# 顺带把 radius / maxHeight 这类"在 hash 之外"的参数也自动跳过。
+	if _has_applied_minmax and sh == _applied_seed_hash:
+		return
 	var path: String = HeightmapBaker.default_path(sh, GpuLodCompositor.BAKE_RES)
 	# 命中缓存 → 主线程直接 load(快, 无需烘焙), 立即应用。
 	if ResourceLoader.exists(path):
@@ -523,6 +535,10 @@ func _apply_minmax(data: GpuMinMaxData) -> void:
 	if not _lod_comp.set_minmax(data):
 		push_warning("[GpuPlanet] MinMax 上传失败(占位 fallback; LOD 不裁剪)")
 	else:
+		# data.seed_hash 由 HeightmapBaker.new_data 写入, 与缓存文件名里的 hash 同源 → 必然等于
+		# 调用侧刚算的 sh。上传成功才记, 失败时保持未应用状态以便下次重试。
+		_applied_seed_hash = data.seed_hash
+		_has_applied_minmax = true
 		print("[GpuPlanet] set_minmax OK → 下帧起 cull 跑, GPU LOD 激活")
 
 
@@ -666,6 +682,9 @@ func _setup_lod_compositor() -> void:
 		push_error("[GpuPlanet] GpuLodCompositor.setup 失败(compute shader 编译错误?)")
 		_lod_comp = null
 		return
+	# 新 compositor = 新 RenderingDevice 资源, 之前上传的 MinMax 纹理跟着旧实例没了 → 复位幂等
+	# 守卫的标记, 否则 seed_hash 没变会被守卫拦住、永远不重传, minmax 一直 not ready。
+	_has_applied_minmax = false
 	# Phase 5: Hi-Z 遮挡剔除 compositor(POST_OPAQUE 建深度金字塔)。接线给 lod_comp 供 PRE_OPAQUE 读。
 	# 编译失败不致命 —— 降级到无遮挡剔除(lod_comp 读不到金字塔 → hiz_ready=0 → 跳过遮挡测试)。
 	_hiz_comp = (_GpuHizCompositor_script as GDScript).new() as GpuHizCompositor
