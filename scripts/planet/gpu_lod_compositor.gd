@@ -497,6 +497,8 @@ func _render_callback(_effect_callback_type: int, render_data: RenderData) -> vo
 		cam.x, cam.y, cam.z, float(fd["radius"]),
 		pcn.x, pcn.y, pcn.z, float(fd["maxHeight"]),
 		float(fd["C_const"]), float(max_level), 0.0, float(MAX_PATCHES),
+		# consts2.x = C_curve: 球面曲率(弓高)误差项系数, 让大半径在粗层提前细分, 消除多边形棱角。
+		float(fd.get("C_curve", 0.0)), 0.0, 0.0, 0.0,
 	])
 	_dispatch_traverse(write_idx, pc_base, -1.0, 1)                       # reset trav_counter
 	for lvl in range(max_level + 1):                                     # per-level 遍历

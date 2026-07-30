@@ -11,8 +11,12 @@ signal bulk_changed
 
 # ---- 几何 ----
 @export_group("几何")
-## 行星半径(世界单位)。改它需要重建网格(见 REBUILD_KEYS)。
-@export_range(10.0, 2000.0, 1.0) var radius: float = 100.0:
+## 行星半径(世界单位)。GPU LOD 下改它会实时生效(地形/大气/海面/角色/剔除都会跟随)。
+## or_greater: 滑条上限 2000 只是常用区间, 可手填更大值。但注意两个尺度耦合:
+##   ① 半径越大, 同 maxLevel 下地形越粗(MAX_GPU_LEVEL=6 是硬上限) → 贴地细节变少;
+##   ② 半径越小(或 maxHeight 越大 / sseThresholdPixels 越小), 可见 patch 数越多 → 可能超 MAX_PATCHES
+##      而丢 patch 露洞(现在会在控制台 push_warning 提示, 并给出调参建议)。
+@export_range(10.0, 2000.0, 1.0, "or_greater") var radius: float = 100.0:
 	set(v): radius = v; param_changed.emit("radius")
 ## 地形隆起的最大高度(相对半径的比例, 实际位移 = height_at × maxHeight)。越大山脉越夸张。
 @export_range(0.0, 50.0, 0.1) var maxHeight: float = 8.0:

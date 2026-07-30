@@ -8,7 +8,8 @@
 //     level==0:              dist >= split_d(0)             → 叶(根不细分); 否则根细分, 往下找
 //     level>0, <maxLevel:    split_d(L) <= dist < 2·split_d(L) → 叶(父细分了、自己不细分)
 //     level==maxLevel:       dist < 2·split_d(L)            → 叶(最深, 父细分了)
-//   其中 split_d(L) = C_const / 2^L, C_const = maxHeight·K/T, K=vp_h/(2·tan(fov/2)), T=sseThresholdPixels。
+//   其中 split_d(L) = max(C_height/2^L, C_curve/4^L) —— 详见下方 split_d() 注释(高度误差 + 球面曲率误差),
+//   C_height = maxHeight·K/T, C_curve = radius·θ0²/8·K/T, K=vp_h/(2·tan(fov/2)), T=sseThresholdPixels。
 //   证明(单调): split_d 随 L 单调降 → dist<2·split_d(L)=split_d(L-1) 蕴含 dist<split_d(L-2)<...<split_d(0),
 //   即所有祖先都细分 → 本节点存在; 再加 dist>=split_d(L) → 自己不细分 → 是叶。无需 ping-pong。
 //
@@ -36,8 +37,21 @@ layout(set = 1, binding = 0, std430) buffer CountBuf { uint count; } counter;
 layout(push_constant, std430) uniform Push {
 	vec4 cam_pos_pad;        // xyz = cam_pos(world), w = radius
 	vec4 planet_center_pad;  // xyz = planet_center(world), w = maxHeight
-	vec4 consts;             // x = C_const, y = maxLevel, z = level, w = MAX_PATCHES
+	vec4 consts;             // x = C_height, y = maxLevel, z = level, w = MAX_PATCHES
+	vec4 consts2;            // x = C_curve(球面曲率项系数), yzw = 预留
 } pc;
+
+// 该层的"细分阈值距离": 相机比它更近 → 应细分。split_d(L) = g_err(L)·K/T, K/T 已由 CPU 预乘进系数。
+// g_err(L) = max(高度误差, 球面曲率误差):
+//   高度误差   = maxHeight / 2^L                      → C_height / 2^L
+//   曲率误差   = radius·θ0²/8 / 4^L (球面弓高 sagitta) → C_curve / 4^L,  θ0 = 二十面体棱角 ≈1.1071rad
+// 【为什么要曲率项】只按高度估误差时, split_d 与 radius 无关 → 半径调大后 patch 物理尺寸变大、球面
+// 逼近误差(弓高)随 radius 线性增长, 却不会更早细分 → 轮廓出现多边形棱角、地形变粗。加入曲率项后
+// 大半径会在**粗层**提前细分, 消除棱角; 细层仍由高度项主导, 故 patch 数不会失控。
+// 单调性: 两项都随 L 严格递减 → max 也递减 → 距离壳判定(依赖 split_d 单调)依然成立。
+float split_d(float L) {
+	return max(pc.consts.x / exp2(L), pc.consts2.x / exp2(2.0 * L));
+}
 
 const float PHI = 1.6180339887498948482;   // (1+√5)/2, 与 gpu_ico.gd T 一致
 const vec3 RAW[12] = vec3[12](
@@ -129,7 +143,7 @@ void main() {
 	vec3 center_dir = normalize(A + B + C);
 	vec3 center_world = pc.planet_center_pad.xyz + center_dir * pc.cam_pos_pad.w;   // radius
 	float dist = distance(pc.cam_pos_pad.xyz, center_world);
-	float sd_l = pc.consts.x / exp2(float(level));   // split_d(level) = C_const / 2^level
+	float sd_l = split_d(float(level));
 	bool self_no_split = (level >= maxLevel) || (dist >= sd_l);
 	// parent_split 必须用【父三角形中心】到相机的距离, 而不是本节点中心的 dist。
 	// 每个节点中心 ≠ 其父中心; 若用自己的 dist 判"父是否细分", 父子会在 LOD 壳边界(dist≈sd)
@@ -141,7 +155,7 @@ void main() {
 		vec3 p_center_dir = normalize(pA + pB + pC);
 		vec3 p_center_world = pc.planet_center_pad.xyz + p_center_dir * pc.cam_pos_pad.w;
 		float parent_dist = distance(pc.cam_pos_pad.xyz, p_center_world);
-		parent_split = (parent_dist < pc.consts.x / exp2(float(level - 1)));   // parent_dist < sd_{level-1}
+		parent_split = (parent_dist < split_d(float(level - 1)));   // parent_dist < sd_{level-1}
 	}
 	if (!(self_no_split && parent_split)) {
 		return;

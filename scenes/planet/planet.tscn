@@ -26,11 +26,10 @@ glow_enabled = true
 
 [sub_resource type="Resource" id="Resource_25nq4"]
 script = ExtResource("4_2vvio")
-radius = 500.0
+radius = 1050.0
 maxHeight = 40.0
 showInset = false
 showOcean = false
-showAtmosphere = false
 showClouds = false
 showGodrays = false
 metadata/_custom_type_script = "uid://7boxikbjeden"
@@ -49,16 +48,17 @@ shadow_enabled = true
 script = ExtResource("3_gp")
 params = SubResource("Resource_25nq4")
 camera = NodePath("Camera3D")
+preview_in_editor = false
 patch_resolution = 8
 
 [node name="RobotCharacter" parent="GpuPlanet" unique_id=1570974038 node_paths=PackedStringArray("external_camera") instance=ExtResource("6_robot")]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 155.23427, 0)
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 662.4174, 0)
 stick_to_water = false
 planet_path = NodePath("..")
 external_camera = NodePath("../Camera3D")
 
 [node name="Camera3D" type="Camera3D" parent="GpuPlanet" unique_id=2085450478]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 86.43082, 432.3692, 737.9434)
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 86.43082, 432.3692, 921.5506)
 script = ExtResource("1_invnv")
 
 [node name="PlanetAtmosphere" type="Node3D" parent="GpuPlanet" unique_id=2088287272 node_paths=PackedStringArray("planet", "sun_light")]

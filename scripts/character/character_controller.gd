@@ -211,9 +211,16 @@ func _read_planet() -> void:
 	_terrain = Terrain.from_params(p)
 
 
-## 参数运行时改变后可调此刷新(可选)。
+## 行星参数运行时改变后刷新缓存(由 GpuPlanet._on_param_changed 自动调用)。
+## 除了重读 radius/maxHeight/seaLevel/Terrain, 还立刻重新贴地 —— 否则改半径后角色会留在旧地表高度:
+## 半径变大 → 埋进地里; 半径变小 → 悬空后长时间自由落体。硬贴一次直接落到新地表, 并清掉竖直速度。
 func refresh_planet() -> void:
 	_read_planet()
+	if is_inside_tree():
+		_snap_to_ground(true)   # initial=true → 硬贴 + _v_up=0 + _grounded=true
+		_up = _current_up()
+		_cam_anchor_r = -1.0    # 重置相机高度/方向平滑, 避免从旧半径插值出长距离飞行
+		_cam_snap = true
 
 
 func _find_first_child_node3d_except_camera() -> Node3D:

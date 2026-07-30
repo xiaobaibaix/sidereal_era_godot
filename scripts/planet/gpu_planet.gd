@@ -25,6 +25,9 @@ const PATCH_TEX_H := MAX_PATCHES + 1 # patch 纹理高(末行存 count)
 const DEFAULT_PATCH_RES := 32        # Phase 2 单叶分辨率/边(四叉树下够用; 越大越平滑越费)
 const MM_NODE_NAME := "GpuPatchMM"
 const MAX_GPU_LEVEL := 6             # 单遍遍历层数上限(4^6=82k 节点/帧, 可测; level 8=1.75M 太重, 留 Phase 6 ping-pong)
+# 二十面体棱的球心张角 = arccos(1/√5) ≈ 1.10715 rad(63.43°)。level L 的 patch 张角 = 此值/2^L,
+# 球面弓高(sagitta) ≈ radius·θ²/8 → 系数 = θ²/8。用于 LOD 的曲率误差项(见 lod_traverse.glsl::split_d)。
+const ICO_SAGITTA_COEF := 0.15322168   # (arccos(1/√5))² / 8
 # 用 preload + GDScript.new() 取代 GpuLodCompositor.new() —— 绕开 class_name 注册时序
 # (@tool 脚本热重载时偶发 "Nonexistent function 'new' in base 'GDScript'", preload 总能用)。
 const _GpuLodCompositor_script := preload("res://scripts/planet/gpu_lod_compositor.gd")
@@ -80,8 +83,11 @@ var _dirty := false
 var _lod_comp: GpuLodCompositor
 var _hiz_comp: GpuHizCompositor   # Phase 5: 遮挡剔除深度金字塔(POST_OPAQUE)
 # Phase 5: 地平线剔除 occluder 球半径 = radius + 全局最小位移(保证内含实心行星, 安全不误剔)。
-# minmax 就绪前用保守下界 radius - maxHeight; 就绪后由 _apply_minmax 更新为更紧的值。
-var _occluder_radius: float = 0.0
+# 这里只缓存**全局最小位移**(烘焙产物, 与 radius 无关), occluder 半径每帧用当前 radius 现算 ——
+# 否则改 radius 后它会滞留旧值(旧代码只在 _apply_minmax 里算), 半径变小时遮挡球比行星还大 →
+# 地平线剔除把整颗星球都判成"背面" → 大面积消失, 直到重烘完成才恢复。
+# NAN = 尚无烘焙数据 → 用保守下界 radius - maxHeight。
+var _minmax_min_disp: float = NAN
 var _frame: int = 0   # 双缓冲帧计数(GpuPlanet 主线程拥有; 决定 compositor 写哪块、绑哪块)
 # 后台烘焙: 20×BAKE_RES² 噪声采样太重(~260 万次 height_at), 放主线程 _ready 会卡死编辑器/运行。
 # 改为 WorkerThreadPool 后台跑, 期间 minmax 未就绪 → _process 绑 fallback(20 面)先渲染, 完成后切 GPU LOD。
@@ -119,6 +125,7 @@ const VIC_APPROACH_FRAC := 0.03       # 每帧接近距离的比例 > 此值 = "
 var _vic: int = MAX_PATCHES           # 当前应用的 visible_instance_count(grow-fast/shrink-slow 平滑)
 var _vic_prev_dist: float = -1.0      # 上一帧相机到球心距离(判接近速率; <0 = 未初始化)
 var _vic_approaching: bool = false    # 本帧是否在快速拉近(→ 顶满)
+var _overflow_warned: bool = false    # MAX_PATCHES 溢出只警告一次(避免每帧刷屏)
 
 
 func _ready() -> void:
@@ -238,14 +245,21 @@ func _process(_delta: float) -> void:
 	# 高空(最不该开)开, 故用模式门取代。occlusion_on 此处 = params.occlusionCulling。
 	var occlusion_want: bool = occlusion_on if (_lod_frozen or _cull_surface_mode) else false
 	_occlusion_applied = occlusion_want
-	# occluder 半径: minmax 就绪后是 radius+全局最小位移(_apply_minmax 设); 否则保守下界 radius-maxHeight。
-	var occluder_r: float = _occluder_radius if _occluder_radius > 0.0 else max(p.radius - p.maxHeight, 1.0)
+	# LOD 曲率误差项系数(与 c_const 同量纲, 共用 K/T): 让大半径在粗层提前细分, 消除多边形棱角。
+	# 用当前 radius(冻结时 k_sse 取快照值, radius 取实时 —— 冻结是调试用, 这点差异无碍)。
+	var c_curve: float = ICO_SAGITTA_COEF * p.radius * k_sse / max(p.sseThresholdPixels, 0.001)
+	# occluder 半径: 用**当前** radius 现算(不缓存) → 改半径立即生效, 无滞后误剔。
+	# 有烘焙数据 → radius + 全局最小位移(更紧); 没有 → 保守下界 radius - maxHeight。
+	var occluder_r: float = maxf(p.radius - p.maxHeight, 1.0)
+	if not is_nan(_minmax_min_disp):
+		occluder_r = maxf(p.radius + _minmax_min_disp, 1.0)
 	_lod_comp.set_frame_data({
 		"cam_pos": cam_pos,
 		"planet_center": global_position,
 		"radius": p.radius,
 		"maxHeight": p.maxHeight,
 		"C_const": c_const,
+		"C_curve": c_curve,
 		"K": k_sse,
 		"maxLevel": min(p.maxLevel, MAX_GPU_LEVEL),
 		"write_idx": write_idx,
@@ -301,6 +315,16 @@ func _apply_visible_count(apply: bool) -> void:
 		return
 	var target: int
 	var rc: int = _lod_comp.get_visible_count() if apply else -1
+	# patch 上限溢出检测: cull shader 的 counter 对**所有**通过剔除的 patch 都 atomicAdd, 超过
+	# MAX_PATCHES 的槽才丢弃 → 回读值 > MAX_PATCHES 就是精确的溢出信号(丢了 rc-MAX_PATCHES 个 patch,
+	# 表现为地形露洞, 且原本静默无提示)。常见诱因: 半径调太小、maxHeight 调太大、sseThresholdPixels
+	# 调太小 —— 都会让细分壳内塞进过多 patch。
+	if rc > MAX_PATCHES and not _overflow_warned:
+		_overflow_warned = true
+		push_warning(("[GpuPlanet] patch 数溢出: 需要 %d 个, 上限 MAX_PATCHES=%d → 丢弃 %d 个(地形会露洞)。"
+			+ "解决: 调大 sseThresholdPixels(更省)、调小 maxHeight、或调大 radius; "
+			+ "要真正提高上限需同步改 gpu_planet/gpu_lod_compositor 的 MAX_PATCHES 与 lod_traverse/lod_cull/"
+			+ "terrain_gpu 里的同名常量(必须一致)。") % [rc, MAX_PATCHES, rc - MAX_PATCHES])
 	if not apply or rc < 0 or _vic_approaching:
 		# 顶满不裁剪。命中: 编辑器预览关/冻结(apply=false); 回读未就绪(rc<0); 或快速拉近(count 暴涨超
 		# 回读 → 顶满防洞, 瞬态)。绕行/静止/远离都不在此列 → 走下面收紧分支, 持续运动中照样有优化。
@@ -463,20 +487,40 @@ func _poll_async_bake() -> void:
 func _apply_minmax(data: GpuMinMaxData) -> void:
 	if _lod_comp == null:
 		return
-	# Phase 5: 用烘焙的全局最小位移算地平线 occluder 球半径(内含实心行星 → 安全)。
-	var p: PlanetParams = _effective_params()
-	_occluder_radius = p.radius + data.global_min_disp()
+	# Phase 5: 只缓存全局最小位移(与 radius 无关); occluder 半径由 _process 每帧用当前 radius 现算。
+	_minmax_min_disp = data.global_min_disp()
 	if not _lod_comp.set_minmax(data):
 		push_warning("[GpuPlanet] MinMax 上传失败(占位 fallback; LOD 不裁剪)")
 	else:
 		print("[GpuPlanet] set_minmax OK → 下帧起 cull 跑, GPU LOD 激活")
 
 
-func _on_param_changed(_key: String) -> void:
+func _on_param_changed(key: String) -> void:
 	_push_params()
-	# 影响高度的参数变 → 重烘 MinMax(种子/频率/振幅类; 半径/海平面等不影响 MinMax, 但 bake_or_load
-	# 走 seed_hash 缓存命中, 重复烘很快, 为简化统一触发)。
+	# 影响高度的参数变 → 重烘 MinMax(种子/频率/振幅类; 半径/海平面等不影响 MinMax, 且 seed_hash 已不含
+	# radius → 改半径直接命中缓存, 不会重烘)。
 	_bake_and_push_minmax()
+	# 通知依赖行星几何的节点刷新其缓存(角色把 radius/maxHeight/seaLevel/Terrain 缓存在 _ready,
+	# 不通知就会按旧半径贴地 → 悬空或沉地)。鸭子类型调用, 不硬依赖角色脚本类型。
+	# 只在**几何相关**的 key 上通知: refresh_planet 会把角色硬贴回地表并清零竖直速度, 若对
+	# 大气/海洋配色之类无关参数也触发, 会在跳跃中途把人拽回地面。
+	if key == "seaLevel" or _effective_params().requires_rebuild(key):
+		_notify_geometry_dependents()
+
+
+# 递归通知子树里实现了 refresh_planet() 的节点(目前是角色控制器)。
+# 只在 param 变时调用(低频), 递归开销可忽略。
+func _notify_geometry_dependents() -> void:
+	if not is_inside_tree():
+		return
+	_notify_refresh_recursive(get_tree().root)
+
+
+func _notify_refresh_recursive(n: Node) -> void:
+	if n.has_method("refresh_planet"):
+		n.call("refresh_planet")
+	for c in n.get_children():
+		_notify_refresh_recursive(c)
 	# 参数变可能改变可见 patch 数(如 maxLevel/sseThreshold)而相机没动 → 先顶满, 靠 shrink-slow 慢慢收紧,
 	# 给异步回读时间追上新 count, 防止用旧 count 收得过紧露洞。
 	_vic = MAX_PATCHES

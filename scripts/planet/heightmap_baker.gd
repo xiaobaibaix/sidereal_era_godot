@@ -67,10 +67,14 @@ static func dir_from_bary(fi: int, u: float, v: float) -> Vector3:
 # 种子 hash(决定缓存命中): 只取影响 height_at 的参数 + baker 版本。参数变 → 重烘;
 # baker 算法变 → BAKER_VERSION 变 → 缓存自动失效。
 # 用 Godot 内置 String.hash()(稳定、跨平台)。
+#
+# 注意 **不含 radius**: 烘出来的是 disp = height_at(dir) × maxHeight, 而 height_at 只取决于噪声参数,
+# 与 radius 无关 → 同一套噪声在任何半径下烘出的数据逐位相同。以前把 radius 算进 hash, 导致每换一个
+# 半径就白白重烘一次(20×bake_res² ≈ 百万级噪声采样)并多存一个 .res 文件。去掉后换半径即刻命中缓存。
 static func compute_seed_hash(params: PlanetParams) -> int:
 	var keys := PackedStringArray([
 		"bv",   # baker version, 前置使旧缓存自动失效
-		"radius", "maxHeight",
+		"maxHeight",
 		"continentSeed", "continentFreq", "continentOctaves", "continentGain", "continentLacunarity",
 		"mountainSeed", "mountainFreq", "mountainOctaves", "mountainStrength",
 		"warpSeed", "warpStrength", "warpFreq",
