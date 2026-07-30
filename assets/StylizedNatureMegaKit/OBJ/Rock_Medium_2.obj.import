@@ -1,0 +1,25 @@
+[remap]
+
+importer="wavefront_obj"
+importer_version=1
+type="Mesh"
+uid="uid://ctjnd5jm7bwln"
+path="res://.godot/imported/Rock_Medium_2.obj-fb000758d7fb3758b07fd5c6fa19af6d.mesh"
+
+[deps]
+
+files=["res://.godot/imported/Rock_Medium_2.obj-fb000758d7fb3758b07fd5c6fa19af6d.mesh"]
+
+source_file="res://assets/StylizedNatureMegaKit/OBJ/Rock_Medium_2.obj"
+dest_files=["res://.godot/imported/Rock_Medium_2.obj-fb000758d7fb3758b07fd5c6fa19af6d.mesh", "res://.godot/imported/Rock_Medium_2.obj-fb000758d7fb3758b07fd5c6fa19af6d.mesh"]
+
+[params]
+
+generate_tangents=true
+generate_lods=true
+generate_shadow_mesh=true
+generate_lightmap_uv2=false
+generate_lightmap_uv2_texel_size=0.2
+scale_mesh=Vector3(1, 1, 1)
+offset_mesh=Vector3(0, 0, 0)
+force_disable_mesh_compression=false

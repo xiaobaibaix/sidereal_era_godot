@@ -58,9 +58,11 @@ func _connect_params_signal() -> void:
 ## 编辑器自由视角(不同于该相机)观察 → 就能看到星球被剔成什么样(视锥外/背面/被遮挡的洞)。
 @export var camera: Camera3D
 
-## 编辑器内预览剔除(@tool): 开 → 编辑器视口也跑 LOD + 剔除, 拖动 camera 节点即时可见效果。
+## 编辑器内预览剔除(@tool): 开 → 编辑器视口也跑 LOD + 剔除, 且**按编辑器视口相机**算(见
+## _active_camera) —— 在视口里飞行时 LOD/剔除跟着你的视角走, camera export 没接也能预览。
 ## 关 → 编辑器里停掉 compositor(省编辑器算力; 运行时不受影响, 始终开)。
-## 提示: 想不拖动也持续刷新, 在 3D 视口右上"透视"菜单勾选"持续更新(Update Continuously)"。
+## 提示: 想不动鼠标也持续刷新, 在 3D 视口右上"透视"菜单勾选"持续更新(Update Continuously)" ——
+## compositor 需要每帧跑, 而编辑器视口默认只在场景有变化时重绘。
 @export var preview_in_editor: bool = true:
 	set(v):
 		preview_in_editor = v
@@ -170,12 +172,16 @@ func _exit_tree() -> void:
 func _process(_delta: float) -> void:
 	# 每帧: 轮询后台烘焙是否完成 → 推 LOD 帧数据 + 绑上一帧写好的纹理。
 	_poll_async_bake()
-	if _lod_comp == null or not is_instance_valid(camera) or _mat == null:
+	if _lod_comp == null or _mat == null:
 		return
 	# 编辑器预览关: compositor 已被 _apply_preview_enabled 禁用; 绑 fallback(基础 20 面)避免读到空 cull_tex。
 	if Engine.is_editor_hint() and not preview_in_editor:
 		_mat.set_shader_parameter("u_patchTex", _patch_tex_fallback)
 		_apply_visible_count(false)   # 不裁剪(fallback 20 面须全可见)
+		return
+	# 编辑器里优先用**编辑器视口相机**(见 _active_camera), 所以 camera export 没接也能预览。
+	var cam: Camera3D = _active_camera()
+	if cam == null:
 		return
 	var p: PlanetParams = _effective_params()
 	var write_idx: int = _frame & 1
@@ -201,15 +207,15 @@ func _process(_delta: float) -> void:
 		occlusion_on = p.occlusionCulling
 		_cam_hist_valid = false
 	else:
-		var vp := camera.get_viewport()
+		var vp := cam.get_viewport()
 		var vp_h: float = float(vp.size.y) if vp != null else 1080.0
-		var fov_rad: float = deg_to_rad(camera.fov)
+		var fov_rad: float = deg_to_rad(cam.fov)
 		k_sse = vp_h / (2.0 * tan(fov_rad * 0.5))
 		c_const = p.maxHeight * k_sse / max(p.sseThresholdPixels, 0.001)
-		cam_pos = camera.global_position
+		cam_pos = cam.global_position
 		# 6 视锥平面(world-space, Godot 内向法线约定)。Camera3D.get_frustum 返回顺序:
 		# near, far, left, top, right, bottom(本项不依赖顺序, shader 全 6 平面测一遍)。
-		frustum = camera.get_frustum() if camera.is_inside_tree() else []
+		frustum = cam.get_frustum() if cam.is_inside_tree() else []
 		horizon_on = p.horizonCulling
 		small_tri_px = p.smallTriPixels
 		occlusion_on = p.occlusionCulling
@@ -219,7 +225,7 @@ func _process(_delta: float) -> void:
 		#   d_ref 用"相机→地平线切点"距离 sqrt(dist²-R²): 贴地小(边缘 patch 近, 不必大外扩)、太空大
 		#   (随距离放大), 比 dist-to-center 更贴合可见地形的实际距离, 避免贴地时过度外扩浪费。
 		if p.cullFrustumMargin > 0.0:
-			var fwd: Vector3 = -camera.global_transform.basis.z
+			var fwd: Vector3 = -cam.global_transform.basis.z
 			var ang: float = 0.0   # 本帧转过的弧度
 			var lin: float = 0.0   # 本帧移动的世界距离
 			if _cam_hist_valid:
@@ -358,23 +364,45 @@ func _apply_visible_count(apply: bool) -> void:
 		_mm.visible_instance_count = _vic
 
 
+# 驱动 LOD/剔除的相机。运行时 = camera export; 编辑器里 = **编辑器视口相机**。
+# 为什么编辑器要用视口相机: LOD 与视锥/地平线/遮挡剔除都按这台相机算。若编辑器里仍用场景的
+# camera 节点, 你在视口里飞行时看到的是"按另一个视角剔除过"的地形 —— 一转视角就是大片空洞,
+# 看着像 bug 其实是剔除正确工作。改用视口相机后, 预览跟着你的视角走, 符合直觉。
+# EditorInterface 只存在于编辑器构建 → 必须用 Engine.get_singleton 按名字取; 直接写
+# EditorInterface.xxx 会让导出的项目在解析期就报 identifier not found。
+func _active_camera() -> Camera3D:
+	if Engine.is_editor_hint():
+		var ei: Object = Engine.get_singleton("EditorInterface")
+		# has_method 守卫: 编辑器 API 改名/挪走时优雅降级回 camera export, 而不是 call 崩在这里。
+		if ei != null and ei.has_method("get_editor_viewport_3d"):
+			var vp: Object = ei.call("get_editor_viewport_3d", 0)
+			if vp != null and vp.has_method("get_camera_3d"):
+				var ec := vp.call("get_camera_3d") as Camera3D
+				if ec != null and ec.is_inside_tree():
+					return ec
+	if is_instance_valid(camera):
+		return camera
+	return null
+
+
 # ---- LOD 冻结接口(供 planet_lod_debug.gd 调; 调试用) ----
 # 冻结: 快照当前相机位置/C_const/K/视锥, 之后 _process 用快照驱动 LOD **和全部剔除**(视锥/地平线/
 # 小三角/遮挡)。遮挡的 Hi-Z 金字塔也一并冻住(停止重建)。于是 LOD + 剔除结果定格在冻结相机视角,
 # 旁观相机(planet_lod_debug.gd)可绕到任意角度检视"被剔成什么样"(缺面 = 被剔的 patch)。
 func freeze_lod() -> void:
-	if not is_instance_valid(camera):
+	var cam: Camera3D = _active_camera()
+	if cam == null:
 		return
 	var p: PlanetParams = _effective_params()
-	var vp := camera.get_viewport()
+	var vp := cam.get_viewport()
 	var vp_h: float = float(vp.size.y) if vp != null else 1080.0
-	var fov_rad: float = deg_to_rad(camera.fov)
+	var fov_rad: float = deg_to_rad(cam.fov)
 	var k: float = vp_h / (2.0 * tan(fov_rad * 0.5))
 	_frozen_c_const = p.maxHeight * k / max(p.sseThresholdPixels, 0.001)
 	_frozen_k = k
-	_frozen_cam_pos = camera.global_position
+	_frozen_cam_pos = cam.global_position
 	# 快照**真实**视锥(不再置空): 冻结后仍按冻结相机做剔除, 旁观相机绕看能看到被剔的洞。
-	_frozen_frustum = camera.get_frustum() if camera.is_inside_tree() else []
+	_frozen_frustum = cam.get_frustum() if cam.is_inside_tree() else []
 	_lod_frozen = true
 
 

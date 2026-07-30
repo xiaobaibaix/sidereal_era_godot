@@ -32,6 +32,8 @@ showOcean = false
 showAtmosphere = false
 showClouds = false
 showGodrays = false
+sunElevation = 26.5
+sunAzimuth = 179.5
 metadata/_custom_type_script = "uid://7boxikbjeden"
 
 [node name="Node" type="Node" unique_id=710792981]
@@ -48,11 +50,10 @@ shadow_enabled = true
 script = ExtResource("3_gp")
 params = SubResource("Resource_25nq4")
 camera = NodePath("Camera3D")
-preview_in_editor = true
 patch_resolution = 8
 
 [node name="RobotCharacter" parent="GpuPlanet" unique_id=1570974038 node_paths=PackedStringArray("external_camera") instance=ExtResource("6_robot")]
-transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 662.4174, 0)
+transform = Transform3D(1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 2558.339, 0)
 stick_to_water = false
 planet_path = NodePath("..")
 external_camera = NodePath("../Camera3D")
