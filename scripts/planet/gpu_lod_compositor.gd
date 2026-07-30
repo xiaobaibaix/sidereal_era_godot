@@ -32,9 +32,10 @@ const PATCH_TEX_H := MAX_PATCHES + 1   # 末行存 count metadata
 const WG := 64                     # workgroup size(与 glsl local_size_x 一致)
 const BAKE_RES := 256              # MinMax 烘焙分辨率(2^8=256; maxLevel 6 最细 64 细分/边 → 每 patch ~4 cell, 保守包围盒足够。512 过度精细且烘焙慢 4×)
 # FrameData UBO(std140): frustum[6](96) + cam(16) + planet(16) + consts(16)
-#   + cull_params(16) + hiz_params(16) + view_proj mat4(64) = 240 字节。
+#   + cull_params(16) + hiz_params(16) + view_proj mat4(64) + view_proj_cur mat4(64) = 304 字节。
 # Phase 5 新增: cull_params(地平线/小三角/遮挡开关+参数)、hiz_params(金字塔元数据)、view_proj(遮挡投影)。
-const FRAME_UBO_SIZE := 240
+# Phase 6 新增: view_proj_cur(本帧矩阵; 与 view_proj 一起做"运动并集"遮挡测试, 消 disocclusion 黑洞)。
+const FRAME_UBO_SIZE := 304
 const LODTEX_RES := 256            # 4×2^MAX_GPU_LEVEL: 最细叶占~4×4 格, 消除三角/方格走样+query 边界抖动。必须与 lod_lodtex/lod_cull 一致
 
 var _rd: RenderingDevice
@@ -83,6 +84,9 @@ var _hiz_sampler: RID             # NEAREST + clamp, textureLod 显式 mip
 var _cur_hiz_set: RID             # 本帧 cull set 7(每帧按当前绑定的 hiz 纹理取缓存)
 # 本帧算好的 view_proj(world→clip, 渲染线程从 render_data 取, 保证与深度缓冲 reverse-Z 约定一致)
 var _view_proj: Projection = Projection()
+# 本帧 world→clip。与 _view_proj(建金字塔那帧)一起做"运动并集"遮挡测试: patch 在两个视点下的屏幕
+# 矩形取并集 → 因相机运动而新露出的 patch 不会被上一帧的深度误剔(消 disocclusion 黑洞)。
+var _view_proj_cur: Projection = Projection()
 var _hiz_info: Dictionary = {}    # {tex, width, height, mips} 或空(未就绪)
 
 # 缓存的 uniform sets(按 RID 经 UniformSetCacheRD 缓存)
@@ -464,10 +468,17 @@ func _render_callback(_effect_callback_type: int, render_data: RenderData) -> vo
 	# 否则"AABB 投影视点"(本帧)与"被采样的深度视点"(上一帧)不一致, 相机一动就错剔/漏剔, 表现为相邻
 	# patch 一个剔一个不剔的碎斑锯齿。用金字塔自带的矩阵 → 投影与深度同一空间, 自洽; 只剩固有的 1 帧
 	# 内容延迟。冻结时金字塔停更, 其矩阵也一并定格 → 遮挡结果定格在冻结视角(旁观相机可绕看)。
+	var frozen: bool = bool(fd.get("lod_frozen", false))
 	if _hiz_info.has("view_proj"):
 		_view_proj = _hiz_info["view_proj"]
-	elif not bool(fd.get("lod_frozen", false)):
+	elif not frozen:
 		_view_proj = _compute_view_proj(render_data)   # 无 provider 时的兜底(遮挡实际也不会跑)
+	# 本帧矩阵(运动并集用)。冻结时**不能**取 render_data —— 那时渲染相机是旁观相机(甚至画中画相机),
+	# 会把无关视点并进测试。冻结时令 cur = 金字塔矩阵 → 并集退化为单视点 → 遮挡结果定格在冻结视角。
+	if frozen:
+		_view_proj_cur = _view_proj
+	else:
+		_view_proj_cur = _compute_view_proj(render_data)
 
 	# 每帧更新 FrameData UBO(frustum + cam + planet + consts + Phase5 剔除参数)
 	_update_frame_ubo(fd)
@@ -513,7 +524,7 @@ func _render_callback(_effect_callback_type: int, render_data: RenderData) -> vo
 func _update_frame_ubo(fd: Dictionary) -> void:
 	var floats := PackedFloat32Array()
 	@warning_ignore("integer_division")
-	floats.resize(FRAME_UBO_SIZE / 4)   # 240 字节 / 4 = 60 floats
+	floats.resize(FRAME_UBO_SIZE / 4)   # 304 字节 / 4 = 76 floats(view_proj 44..59, view_proj_cur 60..75)
 	# frustum[6]: Godot Camera3D.get_frustum() 返回**外向法线** N(指向视锥外),
 	# Godot Plane 存 d = dot(N, p_on_plane), 平面方程 dot(N,P)=d。
 	# 外向 N 下: 视锥内 dot(N,P) < d, 视锥外 dot(N,P) > d。
@@ -580,6 +591,15 @@ func _update_frame_ubo(fd: Dictionary) -> void:
 		floats[44 + ci * 4 + 1] = col.y
 		floats[44 + ci * 4 + 2] = col.z
 		floats[44 + ci * 4 + 3] = col.w
+	# Phase 6 view_proj_cur: 本帧矩阵(运动并集遮挡测试)。紧随 view_proj, 偏移 60 floats。
+	var vpc := _view_proj_cur
+	var cols_c := [vpc.x, vpc.y, vpc.z, vpc.w]
+	for ci in range(4):
+		var col_c: Vector4 = cols_c[ci]
+		floats[60 + ci * 4 + 0] = col_c.x
+		floats[60 + ci * 4 + 1] = col_c.y
+		floats[60 + ci * 4 + 2] = col_c.z
+		floats[60 + ci * 4 + 3] = col_c.w
 	_rd.buffer_update(_frame_ubo, 0, FRAME_UBO_SIZE, floats.to_byte_array())
 
 

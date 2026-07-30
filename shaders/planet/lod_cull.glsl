@@ -34,7 +34,8 @@ layout(set = 4, binding = 0, std140) uniform FrameData {
 	// Phase 5 剔除参数:
 	vec4 cull_params;           // x=horizonEnable, y=horizonOccluderRadius, z=smallTriPixels, w=occlusionEnable
 	vec4 hiz_params;            // x=hiz_w(mip0), y=hiz_h(mip0), z=hiz_mip_count, w=hiz_ready
-	mat4 view_proj;             // world→clip(Godot reverse-Z: near→1, far→0), 遮挡投影用
+	mat4 view_proj;             // 建 Hi-Z 那一帧的 world→clip(= 金字塔内容所在空间; reverse-Z near→1)
+	mat4 view_proj_cur;         // 本帧 world→clip(把 patch 的当前屏幕位置并入测试 → 消 disocclusion 黑洞)
 } fd;
 // Phase 4: LOD lookup texture, 20 face × 64×64 R8UI。每 cell 存覆盖它的叶的 level。
 // 边 query 点 = mid + (1/64) * normalize(mid - 对角 bary) 外推 1 cell(详见 lodtex_selftest.gd)。
@@ -164,15 +165,25 @@ bool _occluded_hiz(vec3 pts[12]) {
 	float z_near = -1.0e9;   // reverse-Z: 最近点 = 最大 z
 	for (int i = 0; i < 12; i++) {
 		vec3 p = pts[i];
-		vec4 clip = fd.view_proj * vec4(p, 1.0);
-		if (clip.w <= 1.0e-6) {
-			return false;   // 有角点在相机后/近平面上 → 不可靠, 不剔
+		// 【运动并集测试 —— 消 disocclusion 黑洞】两个视点各投一次:
+		//   fd.view_proj     = 建金字塔那一帧(= 深度所在空间, 决定"当时哪儿被挡")
+		//   fd.view_proj_cur = 本帧(= patch 现在出现在屏幕哪儿)
+		// 取屏幕矩形【并集】+ 两者中【更近】的 z。若 patch 因相机转动/靠近而移到"上一帧没有遮挡物"的
+		// 屏幕区域, 并集就会覆盖那里 → Hi-Z 取 min 后变得很远 → 判定不成立 → 不剔 → 无黑洞。
+		// 关键性质: 矩形取并集只会让 hz 更小、z_near 取更近只会让阈值更难满足 → 相比单视点【严格更
+		// 保守】。因此本策略只可能【减少】黑洞, 数学上不可能引入新的黑洞。
+		vec4 c0 = fd.view_proj * vec4(p, 1.0);
+		vec4 c1 = fd.view_proj_cur * vec4(p, 1.0);
+		if (c0.w <= 1.0e-6 || c1.w <= 1.0e-6) {
+			return false;   // 任一视点下跨近平面/在相机后 → 投影不可靠, 保守不剔
 		}
-		vec3 ndc = clip.xyz / clip.w;
-		vec2 uv = ndc.xy * 0.5 + 0.5;
-		uv_min = min(uv_min, uv);
-		uv_max = max(uv_max, uv);
-		z_near = max(z_near, ndc.z);
+		vec3 n0 = c0.xyz / c0.w;
+		vec3 n1 = c1.xyz / c1.w;
+		vec2 uv0 = n0.xy * 0.5 + 0.5;
+		vec2 uv1 = n1.xy * 0.5 + 0.5;
+		uv_min = min(uv_min, min(uv0, uv1));
+		uv_max = max(uv_max, max(uv0, uv1));
+		z_near = max(z_near, max(n0.z, n1.z));
 	}
 	// 夹到屏幕 [0,1]; 完全出屏交给 frustum, 这里不重复剔。
 	uv_min = clamp(uv_min, vec2(0.0), vec2(1.0));
