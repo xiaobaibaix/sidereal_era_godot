@@ -10,7 +10,16 @@
 ## 太阳方向取自场景里的 DirectionalLight3D(其 +Z 轴 = 指向太阳, 与 Godot 对地形的光照方向一致);
 ## 没有光源则用 params.sunElevation/sunAzimuth 兜底。
 ##
-## 运行时驱动(**非 @tool**): 编辑器里不预览; compositor 与 ocean 均运行时创建, 不写入 .tscn(无序列化污染)。
+## @tool: 编辑器里也预览(改 showOcean / 大气 / 云参数, 视口里的球体即时变化)。
+## 曾经刻意不做 @tool 以躲开"序列化污染", 现在改为正面解决 —— 与 GpuPlanet 用同一套防护:
+##   ① compositor effect: NOTIFICATION_EDITOR_PRE_SAVE 摘下 / POST_SAVE 挂回 → 不会被写进 .tscn。
+##      (GpuPlanet 踩过这个坑: 早期每次 setup 都往 Compositor 资源 append, 保存后重开累积一堆空跑
+##       的旧 effect, planet.tscn 里曾攒到 5 个。)
+##   ② 建之前先 _purge_atmo_effects 剔掉同类残留, 保证场上只有 1 份。
+##   ③ ocean 壳: _ocean_mesh.owner = null(本来就有)→ 不入盘; 另外 @tool 下每次脚本重载都会重跑
+##      _ready, 所以建壳前要清掉上一轮的同名节点, 否则编辑器里累积一堆 OceanShell。
+## 编辑器预览的总开关复用 GpuPlanet.preview_in_editor(见 _preview_on), 不再单开一个。
+@tool
 class_name PlanetAtmosphere
 extends Node3D
 
@@ -38,9 +47,25 @@ func _ready() -> void:
 	if not enabled:
 		return
 	_resolve_planet()
+	if not _preview_on():
+		return   # 编辑器里预览关 → 什么都不建(省编辑器算力), 运行时不受影响
 	_resolve_sun()
 	_build_ocean()
 	_build_compositor()
+
+
+# 编辑器预览是否启用。复用 GpuPlanet.preview_in_editor —— 一个开关管住全部编辑器预览
+# (LOD 地形 + 大气/云/海洋), 免得两处各有一个还得同步。运行时恒 true。
+func _preview_on() -> bool:
+	if not Engine.is_editor_hint():
+		return true
+	if planet == null:
+		_resolve_planet()
+	# `in` 做属性存在性检查: 编辑器加载/热重载瞬间 GpuPlanet 脚本可能还没就绪, 直接点属性会抛
+	# "Invalid access to property or key"(params setter 里那段字符串版 has_signal 是同一个成因)。
+	if planet != null and "preview_in_editor" in planet:
+		return planet.preview_in_editor
+	return false   # 编辑器里连 GpuPlanet 都找不到 → 不预览(免得拿默认参数瞎画)
 
 
 func _exit_tree() -> void:
@@ -53,8 +78,20 @@ func _exit_tree() -> void:
 
 
 func _process(_delta: float) -> void:
-	if not enabled or planet == null or planet.params == null:
+	if planet == null or planet.params == null:
 		return
+	if not enabled or not _preview_on():
+		# 中途关掉时把已建的东西静默下来, 否则会留着上一帧的状态(海面还在、大气还在跑)。
+		if _atmo != null:
+			_atmo.enabled = false
+		if _ocean_mesh != null and is_instance_valid(_ocean_mesh):
+			_ocean_mesh.visible = false
+		return
+	# 编辑器里预览可能是刚被打开的(_ready 时还关着 → 什么都没建)→ 这里补建, 幂等。
+	if Engine.is_editor_hint() and _atmo == null:
+		_resolve_sun()
+		_build_ocean()
+		_build_compositor()
 	_update_sun()
 	_resize_ocean()
 	_apply_ocean_uniforms()
@@ -106,6 +143,13 @@ func _center() -> Vector3:
 
 # ---- 海洋球壳 ----
 func _build_ocean() -> void:
+	if _ocean_mesh != null and is_instance_valid(_ocean_mesh):
+		return   # 幂等: @tool 下 _ready 会随脚本重载反复触发
+	# 清掉上一轮留下的壳: @tool 重载时成员变量丢了但子节点还挂在树上, 不清就会累积一堆 OceanShell。
+	for c in get_children():
+		if c.name == "OceanShell":
+			remove_child(c)
+			c.queue_free()
 	if _ocean_shader == null:
 		_ocean_shader = load(_OCEAN_SHADER_PATH)
 	_ocean_mesh = MeshInstance3D.new()
@@ -157,10 +201,58 @@ func _build_compositor() -> void:
 	if comp == null:
 		comp = Compositor.new()
 		_we.compositor = comp
+	# 先剔掉同类残留(@tool 重载留下的、或历史上被序列化进 .tscn 的), 保证场上只有 1 份。
+	_purge_atmo_effects(comp)
 	_atmo = AtmosphereCompositor.new()
 	# 追加到现有 effects(与 GpuPlanet 的 LOD/Hi-Z compositor 共存; 各按 pass 时机触发, 顺序无碍)。
 	var effs: Array[CompositorEffect] = comp.compositor_effects.duplicate()
 	effs.append(_atmo)
+	comp.compositor_effects = effs
+
+
+# 剔掉 Compositor 上所有本类型的 effect(同 GpuPlanet._purge_planet_effects)。
+func _purge_atmo_effects(comp: Compositor) -> void:
+	if comp == null:
+		return
+	var kept: Array[CompositorEffect] = []
+	var changed := false
+	for e in comp.compositor_effects:
+		if e is AtmosphereCompositor:
+			changed = true
+			continue
+		kept.append(e)
+	if changed:
+		comp.compositor_effects = kept
+
+
+# 编辑器保存前/后: 摘下 / 挂回动态挂的 effect, 避免它被序列化进 .tscn。
+# ocean 壳那侧靠 _ocean_mesh.owner = null 防护, 本来就不入盘。
+func _notification(what: int) -> void:
+	if what == NOTIFICATION_EDITOR_PRE_SAVE:
+		_detach_atmo_effect()
+	elif what == NOTIFICATION_EDITOR_POST_SAVE:
+		_reattach_atmo_effect()
+
+
+func _detach_atmo_effect() -> void:
+	if not is_inside_tree():
+		return
+	var we: WorldEnvironment = _scan_world_env(get_tree().root)
+	if we == null or we.compositor == null:
+		return
+	_purge_atmo_effects(we.compositor)
+
+
+func _reattach_atmo_effect() -> void:
+	if _atmo == null or not is_inside_tree():
+		return
+	var we: WorldEnvironment = _scan_world_env(get_tree().root)
+	if we == null or we.compositor == null:
+		return
+	var comp: Compositor = we.compositor
+	var effs: Array[CompositorEffect] = comp.compositor_effects.duplicate()
+	if not effs.has(_atmo):
+		effs.append(_atmo)
 	comp.compositor_effects = effs
 
 

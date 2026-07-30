@@ -50,7 +50,18 @@ const _GpuHizCompositor_script := preload("res://scripts/planet/gpu_hiz_composit
 # 连接 params.param_changed → _on_param_changed(幂等; setter 与 _ready 兜底共用)。
 # 用字符串版接口 + has_signal 门槛, 规避加载瞬间信号表未就绪的属性访问崩溃。
 func _connect_params_signal() -> void:
-	if params != null and params.has_signal("param_changed") and not params.is_connected("param_changed", _on_param_changed):
+	if params == null:
+		return
+	if not params.has_signal("param_changed"):
+		# 别静默跳过 —— 连不上信号 = Inspector 调参完全没反应(改噪声/配色/海洋开关都不生效),
+		# 而这里恰好是最容易发生却最难看出原因的地方。
+		# 编辑器里最常见的成因: PlanetParams 从"非 @tool"改成"@tool"之后没重新加载场景 ——
+		# 旧的 placeholder 实例不带脚本定义的信号, has_signal 为 false。关掉场景重开即可。
+		push_warning(
+			"[GpuPlanet] params 没有 param_changed 信号(疑似 placeholder 实例)"
+			+ " → Inspector 调参不会生效。若刚给 PlanetParams 加了 @tool, 请关闭并重新打开场景。")
+		return
+	if not params.is_connected("param_changed", _on_param_changed):
 		params.connect("param_changed", _on_param_changed)
 
 ## 驱动 LOD 的相机(@tool 编辑器 get_viewport 相机不可靠, 用显式引用)。Phase 2 必填。
@@ -586,6 +597,21 @@ func _on_param_changed(key: String) -> void:
 		_notify_geometry_dependents()
 
 
+# 节点的脚本此刻能否真的被调用。
+# 编辑器里非 @tool 脚本的节点是**占位实例**(placeholder): 坑在于 has_method() 照样返回 true
+# (placeholder 保留方法列表供 Inspector 显示), 但真调下去会报
+# "Attempt to call a method on a placeholder instance"。角色控制器(character_controller.gd,
+# 非 @tool)就是这么在编辑器里改 continentSeed 时炸出报错的 —— 它在编辑器里本来也不需要贴地刷新。
+# 用 Script.is_tool() 判定, 而不是简单地在编辑器里整个跳过: 将来若有 @tool 的依赖节点, 仍能收到通知。
+func _callable_here(n: Node) -> bool:
+	if not Engine.is_editor_hint():
+		return true
+	var s := n.get_script() as Script
+	if s == null:
+		return true   # 没挂 GDScript(内置类型 / GDExtension)→ 不存在 placeholder 这回事
+	return s.is_tool()
+
+
 # 递归通知子树里实现了 refresh_planet() 的节点(目前是角色控制器)。
 # 只在 param 变时调用(低频), 递归开销可忽略。
 func _notify_geometry_dependents() -> void:
@@ -595,7 +621,7 @@ func _notify_geometry_dependents() -> void:
 
 
 func _notify_refresh_recursive(n: Node) -> void:
-	if n.has_method("refresh_planet"):
+	if n.has_method("refresh_planet") and _callable_here(n):
 		n.call("refresh_planet")
 	for c in n.get_children():
 		_notify_refresh_recursive(c)
