@@ -260,13 +260,13 @@ signal bulk_changed
 ## 收益: 极远/掠射角下的碎 patch 直接砍掉; 太大(>3)会在远处露洞, 建议 0.5~2。
 @export_range(0.0, 8.0, 0.1) var smallTriPixels: float = 1.0:
 	set(v): smallTriPixels = v; param_changed.emit("smallTriPixels")
-## 遮挡剔除(Hi-Z): 用上一帧深度金字塔(reverse-Z 取 min)剔掉被山体/近处地形挡住的背面 patch。
-## 【默认关】它用上一帧深度, 快速运动时 disocclusion(新转出/靠近而露出的地形被旧深度误判遮挡)会
-## 露空洞三角形 —— 这是单遍"上一帧深度"遮挡的**固有缺陷**, 需两阶段遮挡剔除才能根治(成本高, 且不
-## 适配本 MultiMesh 提交模型)。而地平线剔除已剔行星背面(遮挡大头)、视锥+小三角剔除各司其职, Hi-Z
-## 的额外收益有限, 不值得为它引入运动露洞。保留开关+基础设施, 供将来真正实现两阶段遮挡时再启用。
-## 想临时试开: 运行时按 F3, 或在此设 true(注意快速运动会露洞)。
-@export var occlusionCulling: bool = false:
+## 遮挡剔除(Hi-Z): 用上一帧深度金字塔(reverse-Z 取 min)剔掉被山体/近处地形挡住的 patch。
+## 仅在 CHARACTER(贴地)模式生效(见 gpu_planet.set_cull_mode) —— 贴地时近山遮挡后方地形收益最大;
+## PLANET(高空)模式由地平线剔除负责行星背面, Hi-Z 收益小故停用。
+## 注: 遮挡用的是**上一帧**深度(1 帧内容延迟), 快速运动时新露出的地形仍可能短暂被误剔(disocclusion)。
+## 投影视点已与金字塔视点对齐(gpu_hiz_compositor 记录建图时的 view_proj), 消除了几何不一致造成的碎斑。
+## 运行时可按 F3 开关对比。
+@export var occlusionCulling: bool = true:
 	set(v): occlusionCulling = v; param_changed.emit("occlusionCulling")
 ## 遮挡剔除的最低高度门限(占半径的比例)。相机离地表高度 < 半径×此值时**自动关闭**遮挡剔除。
 ## 原因: 遮挡用上一帧深度(约 1~2 帧延迟), 贴近地表快速平移时"上一帧被挡、这一帧转出来"的地形会

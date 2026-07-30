@@ -149,18 +149,21 @@ bool _point_below_horizon(vec3 P, vec3 center, float Rocc, vec3 csp, float vhSq)
 }
 
 // ---- Phase 5: Hi-Z 遮挡剔除 ----
-// 把世界 AABB 8 角投影到屏幕, 取屏幕矩形 + 最近点深度(reverse-Z 最大 z), 选合适 mip,
-// 采矩形 4 角的 Hi-Z(min = 最远 occluder 的最近面), 若 AABB 最近点仍比它更远 → 全被挡 → cull。
+// 把 patch 的 12 个代表点投影到屏幕, 取屏幕矩形 + 最近点深度(reverse-Z 最大 z), 选合适 mip,
+// 采矩形 4 角的 Hi-Z(min = 该区域最远的最近面), 若 patch 最近点仍比它更远 → 全被挡 → cull。
 // 跨近平面(clip.w<=0)时投影不可靠 → 保守返回 false(不剔)。
-bool _occluded_hiz(vec3 bmin, vec3 bmax) {
+//
+// 【为什么传 12 个实际点, 而不是世界 AABB 的 8 角】patch 是球面上一个**倾斜的三角壳**; 压成世界轴
+// 对齐 AABB 会大幅膨胀(斜薄片外套正方盒), 盒子的最近角点会戳到遮挡它的山丘**前面** → 判"没被完全
+// 挡住" → 漏剔。patch 越粗(远处低 LOD)盒子越夸张, 漏剔越明显(实测: 远处被山挡住的海洋 patch 剔不掉)。
+// 改投影 patch 自身的 12 点(3 角点 + 3 边中点, 各取 minH/maxH 位移): 边中点覆盖球面三角的鼓出, 仍
+// 完整包住 patch(保守、不误剔), 但比世界 AABB 紧得多 → 该剔的能剔掉。
+bool _occluded_hiz(vec3 pts[12]) {
 	vec2 uv_min = vec2(1.0e9);
 	vec2 uv_max = vec2(-1.0e9);
 	float z_near = -1.0e9;   // reverse-Z: 最近点 = 最大 z
-	for (int i = 0; i < 8; i++) {
-		vec3 p = vec3(
-			((i & 1) == 0) ? bmin.x : bmax.x,
-			((i & 2) == 0) ? bmin.y : bmax.y,
-			((i & 4) == 0) ? bmin.z : bmax.z);
+	for (int i = 0; i < 12; i++) {
+		vec3 p = pts[i];
 		vec4 clip = fd.view_proj * vec4(p, 1.0);
 		if (clip.w <= 1.0e-6) {
 			return false;   // 有角点在相机后/近平面上 → 不可靠, 不剔
@@ -302,8 +305,22 @@ void main() {
 	}
 
 	// ---- Phase 5: Hi-Z 遮挡剔除(上一帧深度金字塔; ready 门控) ----
+	// 用 patch 自身 12 点(不是世界 AABB 的 8 角, 见 _occluded_hiz 注释): 3 角点 + 3 边中点(球面三角
+	// 的鼓出处), 各取 minH/maxH 两个径向位移 → 完整包住 patch 但远比 AABB 紧。
 	if (!sentinel && fd.cull_params.w > 0.5 && fd.hiz_params.w > 0.5) {
-		if (_occluded_hiz(box_min, box_max)) {
+		vec3 mAB = normalize(A + B);
+		vec3 mBC = normalize(B + C);
+		vec3 mCA = normalize(C + A);
+		float r_lo = radius + minH;
+		float r_hi = radius + maxH;
+		vec3 pts[12];
+		pts[0] = A_min;  pts[1] = A_max;
+		pts[2] = B_min;  pts[3] = B_max;
+		pts[4] = C_min;  pts[5] = C_max;
+		pts[6] = center + mAB * r_lo;  pts[7] = center + mAB * r_hi;
+		pts[8] = center + mBC * r_lo;  pts[9] = center + mBC * r_hi;
+		pts[10] = center + mCA * r_lo; pts[11] = center + mCA * r_hi;
+		if (_occluded_hiz(pts)) {
 			return;
 		}
 	}

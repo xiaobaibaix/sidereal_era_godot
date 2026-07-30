@@ -34,6 +34,9 @@ var _mip_views: Array = []       # [k] = mip k 的 slice view RID
 var _size: Vector2i = Vector2i.ZERO
 var _mip_count: int = 0
 var _ready := false              # 至少建成一次金字塔(get_hiz 才返回有效)
+# 建本金字塔时所用的 world→clip 矩阵(= 该帧深度缓冲对应的视点)。遮挡测试必须用它把 AABB 投影,
+# 否则"投影视点"与"深度视点"不一致 → 相机一动就错剔/漏剔(碎斑锯齿)。
+var _built_view_proj: Projection = Projection()
 
 var _mutex := Mutex.new()
 var _active := true              # 主线程按 params.occlusionCulling 推
@@ -106,7 +109,11 @@ func set_active(a: bool) -> void:
 func get_hiz() -> Dictionary:
 	if not _ready or not _pyr_tex.is_valid():
 		return {}
-	return {"tex": _pyr_tex, "width": _size.x, "height": _size.y, "mips": _mip_count}
+	# view_proj 一并返回: cull 侧必须用**建金字塔那一帧**的矩阵投影 AABB, 才与金字塔内容同一空间。
+	return {
+		"tex": _pyr_tex, "width": _size.x, "height": _size.y, "mips": _mip_count,
+		"view_proj": _built_view_proj,
+	}
 
 
 func _compile() -> bool:
@@ -221,6 +228,13 @@ func _render_callback(_effect_callback_type: int, render_data: RenderData) -> vo
 		return
 	if not _ensure_pyramid(size):
 		return
+	# 记下本帧深度对应的 world→clip(与 gpu_lod_compositor._compute_view_proj 同款算法)。
+	# cull 侧遮挡测试用它投影 AABB → 投影视点与被采样的深度视点严格一致。
+	var rsd = render_data.get_render_scene_data()
+	if rsd != null:
+		var cam_xform: Transform3D = rsd.get_cam_transform()
+		var proj: Projection = rsd.get_cam_projection()
+		_built_view_proj = proj * Projection(cam_xform.affine_inverse())
 
 	# 1) copy: 深度 → mip0
 	var u_depth := RDUniform.new()

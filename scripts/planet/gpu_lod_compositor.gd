@@ -458,14 +458,16 @@ func _render_callback(_effect_callback_type: int, render_data: RenderData) -> vo
 	var write_idx: int = int(fd.get("write_idx", 0))
 	var max_level: int = int(fd["maxLevel"])
 
-	# Phase 5: view_proj(world→clip)从 render_data 取 —— 渲染线程算, 保证 reverse-Z 约定与深度缓冲一致
-	# (与主线程 camera.get_camera_projection 相比, 这个和 Hi-Z 深度是同一套投影)。遮挡剔除用。
-	# 冻结时**不更新** → 保留冻结前最后一帧(冻结相机)的投影, 与冻住的 Hi-Z 金字塔匹配 →
-	# 遮挡剔除定格在冻结视角(旁观相机绕看被遮挡剔除的洞)。
-	if not bool(fd.get("lod_frozen", false)):
-		_view_proj = _compute_view_proj(render_data)
 	# Phase 5: 查 Hi-Z provider(上一帧建好的金字塔); 未就绪 → 空 → 绑占位、ready=0。
 	_hiz_info = _query_hiz()
+	# 遮挡测试用的 view_proj **必须取自建金字塔那一帧**(provider 随金字塔一起返回), 而不是本帧相机 ——
+	# 否则"AABB 投影视点"(本帧)与"被采样的深度视点"(上一帧)不一致, 相机一动就错剔/漏剔, 表现为相邻
+	# patch 一个剔一个不剔的碎斑锯齿。用金字塔自带的矩阵 → 投影与深度同一空间, 自洽; 只剩固有的 1 帧
+	# 内容延迟。冻结时金字塔停更, 其矩阵也一并定格 → 遮挡结果定格在冻结视角(旁观相机可绕看)。
+	if _hiz_info.has("view_proj"):
+		_view_proj = _hiz_info["view_proj"]
+	elif not bool(fd.get("lod_frozen", false)):
+		_view_proj = _compute_view_proj(render_data)   # 无 provider 时的兜底(遮挡实际也不会跑)
 
 	# 每帧更新 FrameData UBO(frustum + cam + planet + consts + Phase5 剔除参数)
 	_update_frame_ubo(fd)
@@ -502,9 +504,9 @@ func _render_callback(_effect_callback_type: int, render_data: RenderData) -> vo
 		_dispatch_cull(write_idx, -2, 1)                # cull metadata: count → cull_tex META_ROW
 		# Phase 6 方案 B: 异步回读本帧可见 patch 数(延迟 frame_queue_size 帧, 不 stall GPU) →
 		# 主线程据此设 MultiMesh.visible_instance_count, 砍掉空 instance 的顶点 shader 开销。
-		# 冻结时不回读(主线程冻结路径直接设 MAX_PATCHES, 见 gpu_planet._apply_visible_count)。
-		if not bool(fd.get("lod_frozen", false)):
-			_request_visible_count_readback(write_idx)
+		# 冻结时也回读: visible_instance_count 在冻结下固定 MAX_PATCHES(不受此值影响), 但 HUD 的
+		# "可见 patch" 需要实时值 —— 这样可以冻结不动、只按 F3 开关遮挡, 直接看剔除到底省了多少 patch。
+		_request_visible_count_readback(write_idx)
 
 
 # 把 frame_data 打包进 _frame_ubo(std140, 144 字节)。

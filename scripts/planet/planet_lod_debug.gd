@@ -25,6 +25,11 @@ var _speed_mult: float = 1.0
 var _hud_layer: CanvasLayer   # LOD 统计 HUD(验证 Phase 6 方案 B: 提交 instance 数应远小于 MAX_PATCHES)
 var _hud_label: Label
 
+# 冻结画中画(右上角): 显示冻结瞬间视点看到的画面, 用于判断剔除是否误剔(见 _build_frozen_pip)。
+var _pip_layer: CanvasLayer
+var _pip_viewport: SubViewport
+var _pip_camera: Camera3D
+
 
 func _ready() -> void:
 	_gpu_planet = _find_gpu_planet(get_tree().root)
@@ -162,8 +167,10 @@ func _enter_freeze() -> void:
 	_spec_pitch = asin(clamp(fwd.y, -1.0, 1.0))
 	_apply_spectator_rotation()
 	_spectator.current = true
+	_build_frozen_pip()
 	_frozen = true
 	print("[LODDebug] LOD 已冻结; 旁观相机激活 —— WASD 平移 / Q,E 升降 / 右键拖动看向 / 滚轮调速 / Shift 加速")
+	print("[LODDebug] 右上角画中画 = 冻结瞬间的视角(剔除就是按它算的): 那里画面完整 → 剔除正确; 缺地形 → 误剔")
 
 
 func _exit_freeze() -> void:
@@ -174,8 +181,70 @@ func _exit_freeze() -> void:
 	if is_instance_valid(_spectator):
 		_spectator.queue_free()
 	_spectator = null
+	_free_frozen_pip()
 	_frozen = false
 	print("[LODDebug] 已解冻; 恢复 LOD 相机")
+
+
+# 右上角画中画: 渲染**冻结瞬间那个视点**看到的画面。
+# 用途: 剔除是按冻结视点算的 —— 画中画里画面**完整** = 剔除正确(只剔了看不见的); 缺地形 = 误剔。
+# 而主画面(旁观相机)从别的角度看必然有洞(那是被剔的 patch), 不能用来判断对错。两者一起看才能下结论。
+#
+# 实现: SubViewport 复用**主世界**(world_3d), 于是渲染的是同一份 GPU LOD 地形(冻结后的 patch 集合);
+# 里面放一台相机, 位姿锁定为冻结瞬间的 LOD 相机位姿(不再跟随)。
+func _build_frozen_pip() -> void:
+	if not is_instance_valid(_lod_camera):
+		return
+	_free_frozen_pip()
+	var vp_size := Vector2i(384, 216)   # 16:9 小窗
+	_pip_layer = CanvasLayer.new()
+	add_child(_pip_layer)
+	_pip_viewport = SubViewport.new()
+	_pip_viewport.size = vp_size
+	# 复用主世界 → 同一份地形/剔除结果; 不复用会渲染空世界(什么都看不到)。
+	_pip_viewport.world_3d = get_viewport().world_3d
+	_pip_viewport.own_world_3d = false
+	_pip_viewport.transparent_bg = false
+	_pip_viewport.render_target_update_mode = SubViewport.UPDATE_ALWAYS
+	_pip_layer.add_child(_pip_viewport)
+	# 冻结视点相机: 位姿锁死为冻结瞬间的 LOD 相机(复制 transform/fov/near/far)。
+	_pip_camera = Camera3D.new()
+	_pip_camera.fov = _lod_camera.fov
+	_pip_camera.near = _lod_camera.near
+	_pip_camera.far = _lod_camera.far
+	_pip_viewport.add_child(_pip_camera)
+	_pip_camera.global_transform = _lod_camera.global_transform
+	_pip_camera.current = true
+	# 右上角显示 + 边框 + 标题, 免得与主画面混淆。
+	var panel := Panel.new()
+	panel.set_anchors_preset(Control.PRESET_TOP_RIGHT)
+	panel.offset_left = -float(vp_size.x) - 12.0
+	panel.offset_top = 8.0
+	panel.offset_right = -8.0
+	panel.offset_bottom = 8.0 + float(vp_size.y) + 22.0
+	panel.mouse_filter = Control.MOUSE_FILTER_IGNORE   # 不挡鼠标(旁观相机要右键拖动)
+	_pip_layer.add_child(panel)
+	var title := Label.new()
+	title.text = "冻结瞬间视角(剔除依据) — 此处画面完整=剔除正确"
+	title.add_theme_font_size_override("font_size", 11)
+	title.add_theme_color_override("font_color", Color(1, 1, 0.6))
+	title.position = Vector2(4, 2)
+	title.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_child(title)
+	var tr := TextureRect.new()
+	tr.texture = _pip_viewport.get_texture()
+	tr.position = Vector2(2, 20)
+	tr.size = Vector2(float(vp_size.x), float(vp_size.y))
+	tr.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	panel.add_child(tr)
+
+
+func _free_frozen_pip() -> void:
+	if is_instance_valid(_pip_layer):
+		_pip_layer.queue_free()
+	_pip_layer = null
+	_pip_viewport = null
+	_pip_camera = null
 
 
 func _apply_spectator_rotation() -> void:
