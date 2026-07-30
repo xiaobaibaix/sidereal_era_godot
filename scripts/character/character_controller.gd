@@ -40,6 +40,15 @@ enum CamControl { MOUSE_LOOK, MIDDLE_DRAG }
 @export var foot_offset: float = 0.9
 ## 低于海平面时是否夹到海面(可在水面上行走)。关则会走到海床。
 @export var stick_to_water: bool = true
+## 贴地高度的平滑速率(帧率无关, 越大越紧跟地表、越小越丝滑)。
+## 为什么需要: 地形高度来自**程序化噪声**(无限细节), 角色水平走动时脚下采样点每帧都变, 高频噪声让
+## 目标半径逐帧小跳; 若像原来那样每帧硬赋值 global_position, 模型竖直方向就会逐帧颤抖、局部凹陷处
+## 还会"掉一下"。这里对"离球心半径"做低通吸收高频噪声, 让行走丝滑。
+@export var ground_smooth: float = 20.0
+## 贴地平滑的"大落差"阈值(占 foot_offset 的比例)。误差超过它 → 判定为真实地形落差(台阶/悬崖),
+## 直接快速跟上(不平滑), 避免视觉穿地/悬空; 误差小于它 → 判定为噪声抖动, 走平滑。
+## 这样"吸收噪声"与"陡峭处不脱地"两头兼顾。
+@export var ground_snap_threshold: float = 0.5
 
 @export_group("Planet")
 ## 可选: 显式指定 GpuPlanet。留空则自动查找(父级链 → 全场景)。
@@ -102,6 +111,7 @@ var _up: Vector3 = Vector3.UP
 var _face: Vector3 = Vector3.FORWARD   # 维护的"朝向"(切平面内单位向量); up 每帧精确对齐, 只平滑转 yaw
 var _v_up: float = 0.0            # 沿"上"的速度分量(重力/跳跃)
 var _grounded: bool = false
+var _ground_dt: float = 1.0 / 60.0   # 本帧物理步长(供 _snap_to_ground 做帧率无关平滑)
 var _cam_yaw: float = 0.0
 var _cam_pitch: float = -0.2
 var _cur_anim: String = ""
@@ -109,6 +119,7 @@ var _cam_active: bool = false     # 本控制器当前是否在驱动相机(由 
 var _input_active: bool = false   # 角色是否响应键盘移动/跳跃(角色模式 true; 星球模式 false → WASD 不控制角色)
 var _cam_snap: bool = false       # 接管相机后第一帧直接放到位(不 lerp), 避免从旧位置(可能在星球内)飞入
 var _cam_anchor_r: float = -1.0   # 平滑后的相机锚点"离球心半径"(消竖直颤抖); <0 = 未初始化
+var _cam_anchor_dir: Vector3 = Vector3.UP   # 平滑后的锚点方向(消 60Hz 物理步进造成的 look_at 朝向抽动)
 var _cam_dist_target: float = 8.0 # 滚轮设定的目标距离(_ready 初始化为 cam_distance)
 var _cam_dist_cur: float = 8.0    # 平滑后的当前距离(每帧向 target 逼近)
 var _orbiting: bool = false       # MIDDLE_DRAG 模式: 是否正按住中键拖动旋转
@@ -253,7 +264,13 @@ func _gravity_vector() -> Vector3:
 	return Vector3.DOWN * gravity_strength
 
 
-func _physics_process(delta: float) -> void:
+# 角色运动更新。**跑在 _process(渲染帧率)而非 _physics_process(60Hz)** —— 由 _process 调用。
+# 原因: 本控制器是纯手动积分(不用 move_and_slide, 无地面碰撞体, 靠 Terrain.height_at 程序化贴地),
+# 完全不依赖物理步进。放在 60Hz 的 _physics_process 里, 高刷屏(120/144Hz)下角色位置/朝向就以 60Hz
+# 阶跃更新, 而相机在 _process 逐帧跟随 → 模型颤抖、动画不丝滑。挪到 _process 后角色/模型/相机在
+# 同一帧、同一时刻更新, 从源头消除不同步(也不需要引擎物理插值 —— 那反而会与本控制器自己的平滑打架)。
+func _update_movement(delta: float) -> void:
+	_ground_dt = delta   # 供 _snap_to_ground 做帧率无关的贴地平滑
 	_up = _current_up()
 
 	# --- 水平朝向参考 ---
@@ -321,14 +338,31 @@ func _snap_to_ground(initial: bool) -> void:
 		_grounded = true
 		return
 	if dist <= target_r:
-		# 穿地 → 夹回地表, 停下落速度
-		global_position = _center + dir * target_r
+		# 贴地: 不再每帧硬赋值(那会把程序化噪声的高频抖动直接搬到模型上 → 竖直颤抖/"掉一下"),
+		# 而是让半径帧率无关地逼近 target_r。自适应: 误差大(真实台阶/悬崖)→ 快速跟上不脱地;
+		# 误差小(噪声抖动)→ 平滑吸收。跳跃落地(_v_up<0 且刚穿地)也走快速, 免得软绵绵下沉。
+		var err: float = target_r - dist
+		# 落地判定不能用 _v_up<0 —— 重力在贴地【之前】累积(_physics_process 里 _v_up -= g*delta),
+		# 站着走时 _v_up 每帧也是 -g*dt(≈-0.33), 那样会恒判"硬贴"→ 平滑失效。用"明显快于单帧重力增量"
+		# 的下落速度(3 倍余量)区分真实空中坠落 vs 贴地行走的常态负值。
+		var fall_thr: float = -3.0 * _gravity_vector().length() * _ground_dt
+		var hard: bool = err > foot_offset * ground_snap_threshold or _v_up < fall_thr
+		if hard:
+			global_position = _center + dir * target_r
+		else:
+			var t: float = 1.0 - exp(-ground_smooth * _ground_dt)
+			global_position = _center + dir * lerpf(dist, target_r, t)
 		if _v_up < 0.0:
 			_v_up = 0.0
 		_grounded = true
 	else:
 		# 离地一点点也算站着(容差), 否则动画会抖
 		_grounded = (dist - target_r) <= 0.05
+		# 站着但略高于地表(容差内, 常见于上坡/噪声): 同样平滑贴回, 消除"悬空一点点"造成的抖动。
+		# 同样不能用 _v_up<=0(恒真); 只排除**上升中**(跳跃)以免把人往地面拽。
+		if _grounded and _v_up <= 0.001:
+			var t2: float = 1.0 - exp(-ground_smooth * _ground_dt)
+			global_position = _center + dir * lerpf(dist, target_r, t2)
 
 
 func _project_on_tangent(v: Vector3) -> Vector3:
@@ -430,7 +464,9 @@ func get_follow_transform() -> Transform3D:
 	var hr := rel.length()
 	var hdir := (rel / hr) if hr > 1.0e-4 else up
 	var ar := _cam_anchor_r if _cam_anchor_r > 0.0 else hr
-	var anchor := _center + hdir * ar
+	# 与 _process 一致: 用平滑后的锚点方向(未初始化时退回瞬时 hdir), 保证过渡目标位姿与接管后不跳。
+	var adir := _cam_anchor_dir if _cam_anchor_r > 0.0 else hdir
+	var anchor := _center + adir * ar
 	var cam_pos := anchor - look * _cam_dist_cur
 	return Transform3D(Basis.looking_at(look, up), cam_pos)
 
@@ -450,6 +486,9 @@ func _camera_horizontal_dir() -> Vector3:
 
 
 func _process(delta: float) -> void:
+	# 先更新角色运动(渲染帧率, 见 _update_movement 注释), 再摆相机 —— 顺序要紧: 相机必须跟随
+	# 本帧**最终**的角色位姿, 否则又会差一帧产生抖动。
+	_update_movement(delta)
 	# 只有本控制器处于激活(驱动相机)状态时才摆放相机; 否则相机交给外部(轨道相机/CameraDirector)。
 	if not _cam_active:
 		return
@@ -459,9 +498,14 @@ func _process(delta: float) -> void:
 	# 鼠标看向(look)不平滑, 保持跟手。
 	var look := (Quaternion(right, _cam_pitch) * dir).normalized()
 
-	# 锚点 = 角色头部, 但把"离球心的高度"单独做帧率无关低通:
-	#   角色贴地时是被夹到 center + dir*(radius + h*maxHeight); 颤抖只发生在【半径】上(地形起伏),
-	#   方向 dir 随水平移动平滑变化。所以只平滑半径 → 竖直不抖, 水平照常紧跟(不产生跟随延迟)。
+	# 锚点 = 角色头部, 拆成"方向 × 半径"两个分量各自做帧率无关低通:
+	#   半径(_cam_anchor_r): 吸收地形起伏造成的竖直颤抖(下坡尤其明显), 用较慢的 cam_height_smooth。
+	#   方向(_cam_anchor_dir): 吸收角色位置的 60Hz 物理步进, 用较快的 cam_follow_smooth(水平仍跟手)。
+	# 【方向必须也平滑】: anchor 同时是 look_at 的**目标**。角色在 _physics_process(60Hz)更新位置,
+	# 而本函数在渲染帧率(可能 120/144Hz)跑 —— 若 hdir 直接取自 global_position, anchor 就以 60Hz 阶跃,
+	# look_at 每帧朝一个跳变的目标 → 相机**朝向**逐帧抽动。朝向抖动会甩动整个画面, 表现为"星球/地形在
+	# 剧烈抖动"(而星球其实没动)。原实现只平滑了半径、注释误以为"方向随水平移动平滑变化", 故竖直不抖
+	# 但水平朝向仍抖。这里把方向也低通, 让 look 目标与相机位置一样平滑。
 	var head := global_position + up * cam_height
 	var rel := head - _center
 	var hr := rel.length()
@@ -469,11 +513,14 @@ func _process(delta: float) -> void:
 	var snapping := _cam_snap or _cam_anchor_r < 0.0
 	if snapping:
 		_cam_anchor_r = hr
+		_cam_anchor_dir = hdir
 		_cam_dist_cur = _cam_dist_target   # 接管首帧: 距离直接到位, 不插值
 	else:
 		_cam_anchor_r = lerpf(_cam_anchor_r, hr, 1.0 - exp(-cam_height_smooth * delta))
+		# slerp 保持单位长度(球面插值); 方向变化极小时 slerp 退化安全, 仍用 normalized 兜底。
+		_cam_anchor_dir = _cam_anchor_dir.slerp(hdir, 1.0 - exp(-cam_follow_smooth * delta)).normalized()
 		_cam_dist_cur = lerpf(_cam_dist_cur, _cam_dist_target, 1.0 - exp(-cam_zoom_smooth * delta))
-	var anchor := _center + hdir * _cam_anchor_r
+	var anchor := _center + _cam_anchor_dir * _cam_anchor_r
 	var desired := anchor - look * _cam_dist_cur
 	# 相机位置平滑(帧率无关): 吸收 60Hz 物理步进, 水平跟随顺滑不台阶。
 	# 关键: lerp 的起点用【自存的世界坐标 _cam_smooth_pos】, **绝不回读 _camera.global_position**——
