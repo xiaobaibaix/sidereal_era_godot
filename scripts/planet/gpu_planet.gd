@@ -101,9 +101,18 @@ var _last_cam_pos: Vector3 = Vector3.ZERO
 var _last_cam_fwd: Vector3 = Vector3.ZERO
 # 遮挡剔除的高度门控状态(带滞回, 避免在门限附近开关抖动)。
 var _occlusion_gate := true
-# Phase 6 方案 B: 当前应用的 visible_instance_count(渐降平滑, 防抖 + 防回读滞后露洞)。
-# 回读的可见 patch 数 + 安全余量驱动; 未就绪/冻结/编辑器预览关时 = MAX_PATCHES(不裁剪)。
-var _vic: int = MAX_PATCHES
+var _occlusion_applied := false   # 本帧 cull 是否实际应用了遮挡(经运动门后; 供 HUD 显示)
+# Phase 6 方案 B: MultiMesh.visible_instance_count 门控。
+# 快速运动(尤其拉近)时可见 patch 数暴涨, 会超过滞后 frame_queue_size 帧的异步回读值 → 那几帧
+# visible_instance_count 偏小 → 露洞(一闪而过, 拉停自愈)。修法: 用相机运动这个**即时无滞后**的
+# CPU 信号门控 —— 相机一动就顶满 MAX_PATCHES(不裁剪, 保证不露洞); 仅在相机稳定 VIC_STABLE_FRAMES
+# 帧、回读已反映真实值后才收紧到 tight fit(此时静止 → count 不变 → 收紧安全)。
+const VIC_STABLE_FRAMES := 6          # 相机稳定多少帧后才裁剪(需 > 回读延迟 frame_queue_size≈2~3)
+var _vic: int = MAX_PATCHES           # 当前应用的 visible_instance_count
+var _stable_frames: int = 0           # 相机连续"几乎不动"的帧数
+var _vic_prev_cam_pos: Vector3 = Vector3.ZERO
+var _vic_prev_cam_fwd: Vector3 = Vector3.ZERO
+var _vic_cam_hist: bool = false       # 上一帧相机位姿是否已记录(首帧不判定运动)
 
 
 func _ready() -> void:
@@ -202,6 +211,25 @@ func _process(_delta: float) -> void:
 			_cam_hist_valid = true
 		else:
 			_cam_hist_valid = false
+	# Phase 6: 相机稳定性检测(即时 CPU 信号, 无回读滞后)。相机动 → _stable_frames 清零。
+	# 供两处"运动中保守、稳定后优化"用: ① visible_instance_count 门控(_apply_visible_count);
+	# ② 遮挡剔除运动门(见下 occlusion_apply)。共同消除快速运动下的黑洞。
+	if _lod_frozen:
+		_stable_frames = 0
+		_vic_cam_hist = false
+	else:
+		var vfwd: Vector3 = -camera.global_transform.basis.z
+		if _vic_cam_hist:
+			var moved: float = cam_pos.distance_to(_vic_prev_cam_pos)
+			var turned: float = acos(clampf(vfwd.dot(_vic_prev_cam_fwd), -1.0, 1.0))
+			# 阈值: 半径相对量(位置)+ 小角度(朝向); 低于视为"几乎不动"。快速拉近/拖动远超此值 → 清零。
+			if moved > p.radius * 0.001 or turned > 0.0015:
+				_stable_frames = 0
+			else:
+				_stable_frames += 1
+		_vic_prev_cam_pos = cam_pos
+		_vic_prev_cam_fwd = vfwd
+		_vic_cam_hist = true
 	# 遮挡剔除高度门控(仅非冻结): 相机贴近地表时关遮挡(消除 disocclusion 黑洞), 远观时开(省算)。
 	# 带滞回(低于 thr 关, 高于 thr×1.5 才重开)→ 门限附近来回移动不会开关抖动。
 	if not _lod_frozen:
@@ -216,6 +244,12 @@ func _process(_delta: float) -> void:
 			occlusion_on = occlusion_on and _occlusion_gate
 		else:
 			_occlusion_gate = true
+	# occlusion_on 现在 = "想用遮挡"(用户开关 + 高度门); 金字塔照它每帧重建(set_active), 停下即用最新。
+	# 但 cull 里"是否应用"遮挡再加一道运动门: 快速运动时不应用 —— Hi-Z 用的是上一帧深度, 快速运动
+	# disocclusion(山背后新露出的地形被上一帧深度误判为遮挡)会露黑洞(用户实测确认)。相机稳定
+	# VIC_STABLE_FRAMES 帧后再应用(此时上一帧深度≈当前视野, 遮挡安全)。冻结时按冻结值应用(视角/深度都定格)。
+	var occlusion_apply: bool = occlusion_on if _lod_frozen else (occlusion_on and _stable_frames >= VIC_STABLE_FRAMES)
+	_occlusion_applied = occlusion_apply
 	# occluder 半径: minmax 就绪后是 radius+全局最小位移(_apply_minmax 设); 否则保守下界 radius-maxHeight。
 	var occluder_r: float = _occluder_radius if _occluder_radius > 0.0 else max(p.radius - p.maxHeight, 1.0)
 	_lod_comp.set_frame_data({
@@ -231,7 +265,7 @@ func _process(_delta: float) -> void:
 		"horizonCulling": horizon_on,
 		"horizonOccluderRadius": occluder_r,
 		"smallTriPixels": small_tri_px,
-		"occlusionCulling": occlusion_on,
+		"occlusionCulling": occlusion_apply,
 		"frustumMargin": frustum_margin,
 		"lod_frozen": _lod_frozen,
 	})
@@ -241,6 +275,7 @@ func _process(_delta: float) -> void:
 	#          于是遮挡剔除也定格在冻结视角, 旁观相机可绕看被遮挡剔除的洞。
 	#   遮挡关 → 不建。
 	if _hiz_comp != null:
+		# 金字塔照常每帧重建(不受运动门影响)→ 相机一停, cull 立刻能用到最新深度。
 		_hiz_comp.set_active(occlusion_on and not _lod_frozen)
 	# minmax 未就绪时 cull 被跳过 → cull_tex 全 0 → vertex 坍缩无渲染(灰屏);
 	# 此时保持绑 fallback(20 面 Phase-1 风格), 让用户看到东西而不是空屏。
@@ -266,28 +301,30 @@ func _process(_delta: float) -> void:
 # 上万空 instance 白跑顶点 shader。设 visible_instance_count 让 GPU 干脆不提交它们。
 #
 # 正确性: vertex 的 META_ROW 坍缩守卫仍在 → visible_instance_count 只是"上限优化", 过大无害
-# (多出的 instance 坍缩丢弃), 过小才会把有效 patch 裁掉露洞。回读延迟 frame_queue_size 帧, 故:
-#   ① 带安全余量(×1.5 + 256)覆盖回读窗口内 patch 数增长; ② 增长立即跟上、收缩缓降, 防露洞防抖。
-#   apply=false(编辑器预览关 / minmax 未就绪 / 冻结) 或 回读未就绪(rc<0) → MAX_PATCHES(不裁剪, 安全降级)。
+# (多出的 instance 坍缩丢弃), 过小才会把有效 patch 裁掉露洞。异步回读延迟 frame_queue_size 帧,
+# 快速运动时可见数增长会超过回读值 → 露洞。故改用**相机运动门控**(见 _process 里 _stable_frames):
+#   • apply=false(编辑器预览关/冻结)、回读未就绪、或相机运动/刚停不足 VIC_STABLE_FRAMES 帧 →
+#     顶满 MAX_PATCHES(不裁剪, 保证不露洞)。相机运动是即时信号、无回读滞后。
+#   • 相机稳定 >= VIC_STABLE_FRAMES 帧(回读已追上真实值, 且静止时 count 不变)→ 收紧到 rc×1.3+128。
 func _apply_visible_count(apply: bool) -> void:
 	if _mm == null:
 		return
 	var target: int
-	if not apply:
+	if not apply or _stable_frames < VIC_STABLE_FRAMES:
+		# 顶满不裁剪。命中场景: 编辑器预览关 / 冻结(apply=false); 或相机仍在动/刚停不足
+		# VIC_STABLE_FRAMES 帧。相机运动是即时信号(无回读滞后), 一动就顶满 → 快速拉近拉远不露洞。
 		target = MAX_PATCHES
 	else:
 		var rc: int = _lod_comp.get_visible_count()
 		if rc < 0:
 			target = MAX_PATCHES   # 回读未就绪(前几帧 / 后端不支持 async) → 不裁剪
 		else:
-			target = clampi(int(ceil(float(rc) * 1.5)) + 256, 0, MAX_PATCHES)
-	# 增长立即跟上(安全方向: 过量 instance 坍缩无害); 收缩缓降(~12.5%/帧, 至少 64), 防抖 + 防回读滞后露洞。
-	if target >= _vic:
-		_vic = target
-	else:
-		_vic = maxi(target, _vic - maxi(64, int(float(_vic - target) / 8.0)))
-	if _mm.visible_instance_count != _vic:
-		_mm.visible_instance_count = _vic
+			# 相机已稳定 >= VIC_STABLE_FRAMES 帧 → 回读反映当前真实可见数(静止时 count 不变) →
+			# 直接收紧到 rc×1.3 + 128(小余量抗回读噪声)。此时 count 稳定, 直接跳到 target 不会露洞。
+			target = clampi(int(ceil(float(rc) * 1.3)) + 128, 0, MAX_PATCHES)
+	_vic = target
+	if _mm.visible_instance_count != target:
+		_mm.visible_instance_count = target
 
 
 # ---- LOD 冻结接口(供 planet_lod_debug.gd 调; 调试用) ----
@@ -324,7 +361,26 @@ func is_lod_frozen() -> bool:
 #   max       = MAX_PATCHES(未优化时的提交数)
 func get_lod_stats() -> Dictionary:
 	var rc: int = _lod_comp.get_visible_count() if _lod_comp != null else -1
-	return {"visible": rc, "submitted": _vic, "max": MAX_PATCHES}
+	var p: PlanetParams = _effective_params()
+	return {
+		"visible": rc, "submitted": _vic, "max": MAX_PATCHES,
+		"occlusion": p.occlusionCulling, "occlusion_applied": _occlusion_applied,
+		"horizon": p.horizonCulling,
+	}
+
+
+# 调试用(planet_lod_debug F3/F4): 运行时开关遮挡 / 地平线剔除, 快速定位"快速运动黑洞"来自哪种剔除。
+# 剔除跑在上一帧数据上(1 帧延迟), 快速运动时被剔集合滞后 → 露洞。逐个关掉即可定位元凶。
+func debug_toggle_occlusion() -> bool:
+	var p: PlanetParams = _effective_params()
+	p.occlusionCulling = not p.occlusionCulling
+	return p.occlusionCulling
+
+
+func debug_toggle_horizon() -> bool:
+	var p: PlanetParams = _effective_params()
+	p.horizonCulling = not p.horizonCulling
+	return p.horizonCulling
 
 
 # 切换单遍着色器线框(F1 用)。不走 DEBUG_DRAW_WIREFRAME(那会额外 line pass, 12288 instance 爆帧)。
@@ -401,6 +457,8 @@ func _on_param_changed(_key: String) -> void:
 	# 影响高度的参数变 → 重烘 MinMax(种子/频率/振幅类; 半径/海平面等不影响 MinMax, 但 bake_or_load
 	# 走 seed_hash 缓存命中, 重复烘很快, 为简化统一触发)。
 	_bake_and_push_minmax()
+	# 参数变可能改变可见 patch 数(如 maxLevel/sseThreshold)而相机没动 → 视为不稳定, 暂不裁剪防露洞。
+	_stable_frames = 0
 
 
 func _schedule_rebuild() -> void:

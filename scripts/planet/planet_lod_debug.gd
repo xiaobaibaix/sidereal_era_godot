@@ -58,8 +58,15 @@ func _update_hud() -> void:
 	var sub: int = int(s.get("submitted", 0))
 	var mx: int = int(s.get("max", 0))
 	var vis_txt: String = str(vis) if vis >= 0 else "…(回读未就绪)"
-	_hud_label.text = "LOD 可见 patch: %s   提交 instance: %d / %d%s" % [
-		vis_txt, sub, mx, ("   [LOD 冻结]" if _frozen else "")]
+	var occ: bool = bool(s.get("occlusion", false))          # 意愿开关(F3)
+	var occ_app: bool = bool(s.get("occlusion_applied", false))  # cull 实际是否应用(运动门后)
+	var hor: bool = bool(s.get("horizon", false))
+	var occ_txt: String = "关"
+	if occ:
+		occ_txt = "开" if occ_app else "开(运动暂停)"   # 意愿开但运动中被门控暂停
+	_hud_label.text = "LOD 可见 patch: %s   提交 instance: %d / %d%s\n遮挡剔除(F3): %s   地平线剔除(F4): %s" % [
+		vis_txt, sub, mx, ("   [LOD 冻结]" if _frozen else ""),
+		occ_txt, ("开" if hor else "关")]
 
 
 func _find_gpu_planet(n: Node) -> GpuPlanet:
@@ -78,6 +85,12 @@ func _unhandled_input(event: InputEvent) -> void:
 			_toggle_wireframe()
 		elif event.keycode == KEY_F2:
 			_toggle_freeze()
+		elif event.keycode == KEY_F3:
+			if _gpu_planet != null:
+				print("[LODDebug] 遮挡剔除(Hi-Z): %s" % ("开" if _gpu_planet.debug_toggle_occlusion() else "关"))
+		elif event.keycode == KEY_F4:
+			if _gpu_planet != null:
+				print("[LODDebug] 地平线剔除: %s" % ("开" if _gpu_planet.debug_toggle_horizon() else "关"))
 	if not _frozen or not is_instance_valid(_spectator):
 		return
 	# 旁观相机: 右键拖动看向。
