@@ -103,17 +103,16 @@ var _occlusion_applied := false   # 本帧 cull 是否实际应用了遮挡(供 
 # 相机模式(由 CameraDirector.set_cull_mode 推): true=CHARACTER(贴地聚焦角色 → 开 Hi-Z 遮挡),
 # false=PLANET(高空聚焦星球 → 关 Hi-Z, 靠地平线+视锥剔除, 避免绕球/拉近时 disocclusion 露洞)。
 var _cull_surface_mode: bool = true
-# Phase 6 方案 B: MultiMesh.visible_instance_count 门控。
-# 快速运动(尤其拉近)时可见 patch 数暴涨, 会超过滞后 frame_queue_size 帧的异步回读值 → 那几帧
-# visible_instance_count 偏小 → 露洞(一闪而过, 拉停自愈)。修法: 用相机运动这个**即时无滞后**的
-# CPU 信号门控 —— 相机一动就顶满 MAX_PATCHES(不裁剪, 保证不露洞); 仅在相机稳定 VIC_STABLE_FRAMES
-# 帧、回读已反映真实值后才收紧到 tight fit(此时静止 → count 不变 → 收紧安全)。
-const VIC_STABLE_FRAMES := 6          # 相机稳定多少帧后才裁剪(需 > 回读延迟 frame_queue_size≈2~3)
-var _vic: int = MAX_PATCHES           # 当前应用的 visible_instance_count
-var _stable_frames: int = 0           # 相机连续"几乎不动"的帧数
-var _vic_prev_cam_pos: Vector3 = Vector3.ZERO
-var _vic_prev_cam_fwd: Vector3 = Vector3.ZERO
-var _vic_cam_hist: bool = false       # 上一帧相机位姿是否已记录(首帧不判定运动)
+# Phase 6 方案 B: MultiMesh.visible_instance_count 自适应裁剪。
+# 靠异步回读的可见 patch 数(滞后 frame_queue_size≈2~3 帧)+ 余量设提交上限, 砍掉空 instance。
+# 露洞只发生在"可见数增长快于回读能追上"时, 而**大幅增长几乎只来自快速接近星球(拉近)**: 距离 d↓
+# → 近地 count≈1/d² 暴涨。绕行/远离/静止时 count 稳定或下降, 滞后回读 + 余量足以覆盖, 可正常裁剪。
+# 所以: 平时(含绕行等持续运动)都按回读收紧 → 运动中也有优化; 仅"快速拉近"时顶满 MAX 防洞
+# (用距离变化率即时判定, 无回读滞后; 绕行时距离≈不变 → 不触发)。
+const VIC_APPROACH_FRAC := 0.03       # 每帧接近距离的比例 > 此值 = "快速拉近" → 顶满防洞(绕行≈0 不触发)
+var _vic: int = MAX_PATCHES           # 当前应用的 visible_instance_count(grow-fast/shrink-slow 平滑)
+var _vic_prev_dist: float = -1.0      # 上一帧相机到球心距离(判接近速率; <0 = 未初始化)
+var _vic_approaching: bool = false    # 本帧是否在快速拉近(→ 顶满)
 
 
 func _ready() -> void:
@@ -212,25 +211,19 @@ func _process(_delta: float) -> void:
 			_cam_hist_valid = true
 		else:
 			_cam_hist_valid = false
-	# Phase 6: 相机稳定性检测(即时 CPU 信号, 无回读滞后)。相机动 → _stable_frames 清零。
-	# 供两处"运动中保守、稳定后优化"用: ① visible_instance_count 门控(_apply_visible_count);
-	# ② 遮挡剔除运动门(见下 occlusion_apply)。共同消除快速运动下的黑洞。
+	# Phase 6 方案 B: 快速拉近检测(即时 CPU 信号, 无回读滞后)。仅快速接近星球时可见 patch 数才会暴涨到
+	# 超过滞后回读 → 顶满防洞; 绕行/远离/静止时 count 稳定或下降 → 不触发, 走裁剪分支(持续运动也有优化)。
 	if _lod_frozen:
-		_stable_frames = 0
-		_vic_cam_hist = false
+		_vic_approaching = false
+		_vic_prev_dist = -1.0
 	else:
-		var vfwd: Vector3 = -camera.global_transform.basis.z
-		if _vic_cam_hist:
-			var moved: float = cam_pos.distance_to(_vic_prev_cam_pos)
-			var turned: float = acos(clampf(vfwd.dot(_vic_prev_cam_fwd), -1.0, 1.0))
-			# 阈值: 半径相对量(位置)+ 小角度(朝向); 低于视为"几乎不动"。快速拉近/拖动远超此值 → 清零。
-			if moved > p.radius * 0.001 or turned > 0.0015:
-				_stable_frames = 0
-			else:
-				_stable_frames += 1
-		_vic_prev_cam_pos = cam_pos
-		_vic_prev_cam_fwd = vfwd
-		_vic_cam_hist = true
+		var dist_now: float = cam_pos.distance_to(global_position)
+		if _vic_prev_dist > 0.0:
+			var approach_frac: float = (_vic_prev_dist - dist_now) / maxf(dist_now, 1.0)
+			_vic_approaching = approach_frac > VIC_APPROACH_FRAC
+		else:
+			_vic_approaching = false
+		_vic_prev_dist = dist_now
 	# 遮挡剔除(Hi-Z)按相机模式选择性启用 —— 不同视角下有价值的剔除不同, 全开反而在不合适的模式添乱:
 	#   PLANET(高空聚焦星球, 绕球/拉近拉远): 关。地平线剔除已把行星背面剔干净, Hi-Z 额外收益极小, 却因
 	#     用上一帧深度在运动时 disocclusion(新露出地形被误判遮挡)露黑洞(用户实测)。关掉即无洞。
@@ -299,21 +292,22 @@ func _apply_visible_count(apply: bool) -> void:
 	if _mm == null:
 		return
 	var target: int
-	if not apply or _stable_frames < VIC_STABLE_FRAMES:
-		# 顶满不裁剪。命中场景: 编辑器预览关 / 冻结(apply=false); 或相机仍在动/刚停不足
-		# VIC_STABLE_FRAMES 帧。相机运动是即时信号(无回读滞后), 一动就顶满 → 快速拉近拉远不露洞。
+	var rc: int = _lod_comp.get_visible_count() if apply else -1
+	if not apply or rc < 0 or _vic_approaching:
+		# 顶满不裁剪。命中: 编辑器预览关/冻结(apply=false); 回读未就绪(rc<0); 或快速拉近(count 暴涨超
+		# 回读 → 顶满防洞, 瞬态)。绕行/静止/远离都不在此列 → 走下面收紧分支, 持续运动中照样有优化。
 		target = MAX_PATCHES
 	else:
-		var rc: int = _lod_comp.get_visible_count()
-		if rc < 0:
-			target = MAX_PATCHES   # 回读未就绪(前几帧 / 后端不支持 async) → 不裁剪
-		else:
-			# 相机已稳定 >= VIC_STABLE_FRAMES 帧 → 回读反映当前真实可见数(静止时 count 不变) →
-			# 直接收紧到 rc×1.3 + 128(小余量抗回读噪声)。此时 count 稳定, 直接跳到 target 不会露洞。
-			target = clampi(int(ceil(float(rc) * 1.3)) + 128, 0, MAX_PATCHES)
-	_vic = target
-	if _mm.visible_instance_count != target:
-		_mm.visible_instance_count = target
+		# 回读×1.4 + 256 余量: 覆盖回读滞后窗口内 count 的**缓慢**增长(绕行 / 慢速接近)。快速接近已由
+		# _vic_approaching 兜底顶满, 故此处余量不必很大。
+		target = clampi(int(ceil(float(rc) * 1.4)) + 256, 0, MAX_PATCHES)
+	# 增长立即跟上(安全方向: 过量 instance 坍缩无害); 收缩缓降(~12.5%/帧, 至少 64), 防抖 + 抹回读噪声。
+	if target >= _vic:
+		_vic = target
+	else:
+		_vic = maxi(target, _vic - maxi(64, int(float(_vic - target) / 8.0)))
+	if _mm.visible_instance_count != _vic:
+		_mm.visible_instance_count = _vic
 
 
 # ---- LOD 冻结接口(供 planet_lod_debug.gd 调; 调试用) ----
@@ -453,8 +447,9 @@ func _on_param_changed(_key: String) -> void:
 	# 影响高度的参数变 → 重烘 MinMax(种子/频率/振幅类; 半径/海平面等不影响 MinMax, 但 bake_or_load
 	# 走 seed_hash 缓存命中, 重复烘很快, 为简化统一触发)。
 	_bake_and_push_minmax()
-	# 参数变可能改变可见 patch 数(如 maxLevel/sseThreshold)而相机没动 → 视为不稳定, 暂不裁剪防露洞。
-	_stable_frames = 0
+	# 参数变可能改变可见 patch 数(如 maxLevel/sseThreshold)而相机没动 → 先顶满, 靠 shrink-slow 慢慢收紧,
+	# 给异步回读时间追上新 count, 防止用旧 count 收得过紧露洞。
+	_vic = MAX_PATCHES
 
 
 func _schedule_rebuild() -> void:
