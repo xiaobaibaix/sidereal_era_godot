@@ -3,7 +3,7 @@
 [ext_resource type="Texture2D" uid="uid://1dvcnsbflecp" path="res://assets/picture/GalaxyBackground.hdr" id="1_ihcuv"]
 [ext_resource type="Script" uid="uid://cjg2w1cypjy4u" path="res://scripts/core/orbit_camera.gd" id="1_invnv"]
 [ext_resource type="Script" uid="uid://b5fjitb743vfj" path="res://scripts/planet/gpu_planet.gd" id="3_gp"]
-[ext_resource type="Script" uid="uid://7boxikbjeden" path="res://scripts/core/planet_params.gd" id="4_2vvio"]
+[ext_resource type="Resource" uid="uid://cyfpexs2xvgrq" path="res://assets/tres/planet_params2.tres" id="3_ihcuv"]
 [ext_resource type="Script" uid="uid://rgcdpm1go5yq" path="res://scripts/planet/planet_lod_debug.gd" id="4_dbg"]
 [ext_resource type="PackedScene" uid="uid://beyqcputa5pgw" path="res://scenes/fps.tscn" id="5_42vvu"]
 [ext_resource type="PackedScene" uid="uid://chettq2yjg6nk" path="res://scenes/character/robot_character.tscn" id="6_robot"]
@@ -24,33 +24,6 @@ glow_enabled = true
 
 [sub_resource type="Compositor" id="Compositor_gplod"]
 
-[sub_resource type="Resource" id="Resource_25nq4"]
-script = ExtResource("4_2vvio")
-radius = 2000.0
-maxHeight = 17.1
-showOcean = false
-showAtmosphere = false
-showClouds = false
-showGodrays = false
-sunElevation = 26.5
-sunAzimuth = 179.5
-maxLevel = 12
-sseThresholdPixels = 1.0
-smallTriPixels = 1.8
-continentSeed = 1338
-mountainSeed = 9005
-mountainFreq = 7.05
-mountainOctaves = 8
-mountainStrength = 0.27
-warpStrength = 0.26
-warpFreq = 4.72
-plateFreq = 2.5999999999999996
-plateStrength = 2.0
-moistureFreq = 2.05
-useClimate = false
-climateAltRange = 1.14
-metadata/_custom_type_script = "uid://7boxikbjeden"
-
 [node name="Node" type="Node" unique_id=710792981]
 
 [node name="WorldEnvironment" type="WorldEnvironment" parent="." unique_id=1233767851]
@@ -63,7 +36,7 @@ shadow_enabled = true
 
 [node name="GpuPlanet" type="Node3D" parent="." unique_id=1899334455 node_paths=PackedStringArray("camera")]
 script = ExtResource("3_gp")
-params = SubResource("Resource_25nq4")
+params = ExtResource("3_ihcuv")
 camera = NodePath("Camera3D")
 patch_resolution = 8
 

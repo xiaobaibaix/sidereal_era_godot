@@ -113,6 +113,7 @@ var _frame: int = 0   # 双缓冲帧计数(GpuPlanet 主线程拥有; 决定 com
 # 用独立 bool 而不是拿 0 / -1 当哨兵: String.hash() 可以返回任意 int, 包括 0。
 var _applied_seed_hash: int = 0
 var _has_applied_minmax: bool = false
+var _bake_start_ms: int = 0          # 烘焙起始时刻, 用于日志报耗时(判断该不该等)
 var _bake_group_id: int = -1
 var _bake_result: GpuMinMaxData     # group task 期间由 worker 并发写 face_mip0[fi](各写各的, 无锁)
 var _bake_terrain: Terrain          # 共享只读噪声实例(height_at 不写成员 → 并发安全)
@@ -507,7 +508,8 @@ func _bake_and_push_minmax() -> void:
 	if ResourceLoader.exists(path):
 		var cached: Resource = load(path)
 		if cached is GpuMinMaxData:
-			print("[GpuPlanet] MinMax 缓存命中 → 直接加载, GPU LOD 立即激活")
+			print("[GpuPlanet] MinMax 缓存命中(hash=%08x) → 直接加载, GPU LOD 立即激活"
+					% (sh & 0xFFFFFFFF))
 			_apply_minmax(cached as GpuMinMaxData)
 			return
 	# 未命中 → 后台面级并行烘焙(避免主线程/编辑器卡死); 期间用 fallback 20 面渲染。
@@ -518,9 +520,11 @@ func _bake_and_push_minmax() -> void:
 	# 既不 resize 也不碰 _pyramid → 无需加锁。
 	_bake_result = HeightmapBaker.new_data(p, GpuLodCompositor.BAKE_RES)
 	_bake_terrain = Terrain.from_params(p)
+	_bake_start_ms = Time.get_ticks_msec()
 	_bake_group_id = WorkerThreadPool.add_group_task(
 		_bake_face_task, GpuIco.FACE_COUNT, -1, false, "planet minmax bake")
-	print("[GpuPlanet] MinMax 缓存未命中 → 后台并行烘焙中(先用 20 面 fallback, 烘完自动切 GPU LOD)")
+	print("[GpuPlanet] MinMax 缓存未命中(hash=%08x) → 后台并行烘焙中(先用 20 面 fallback, 烘完自动切 GPU LOD)"
+			% (sh & 0xFFFFFFFF))
 
 
 # group task 体(worker 线程, 每面一个): 纯 CPU 噪声采样, 不碰 RenderingDevice / 场景树。
@@ -563,7 +567,8 @@ func _poll_async_bake() -> void:
 		var err: Error = ResourceSaver.save(data, _bake_save_path)
 		if err != OK:
 			push_warning("[GpuPlanet] MinMax 缓存存盘失败 %s: %d" % [_bake_save_path, err])
-	print("[GpuPlanet] 后台烘焙完成: bake_res=%d → 上传 GPU" % data.bake_res)
+	print("[GpuPlanet] 后台烘焙完成: bake_res=%d, 耗时 %.2f s → 上传 GPU"
+			% [data.bake_res, float(Time.get_ticks_msec() - _bake_start_ms) / 1000.0])
 	_apply_minmax(data)
 
 

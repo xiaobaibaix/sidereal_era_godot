@@ -1,0 +1,39 @@
+[gd_resource type="Resource" script_class="PlanetParams" format=3 uid="uid://cyfpexs2xvgrq"]
+
+[ext_resource type="Script" uid="uid://7boxikbjeden" path="res://scripts/core/planet_params.gd" id="1_uy2do"]
+
+[resource]
+script = ExtResource("1_uy2do")
+radius = 2000.0
+maxHeight = 17.1
+showClouds = false
+showGodrays = false
+sunElevation = 26.5
+sunAzimuth = 179.5
+atmoScale = 1.1
+atmoRayleigh = 0.01
+atmoMie = 0.01
+atmoMieG = 0.0
+atmoDensityFalloff = 16.0
+atmoMieFalloff = 32.0
+atmoSunIntensity = 11.2
+atmoRenderScale = 0.8
+atmoShadowSoftness = 0.47
+atmoTwilight = 0.47
+atmoOzone = 0.005
+maxLevel = 12
+sseThresholdPixels = 1.0
+smallTriPixels = 1.8
+continentSeed = 1338
+mountainSeed = 9005
+mountainFreq = 7.05
+mountainOctaves = 8
+mountainStrength = 0.27
+warpStrength = 0.26
+warpFreq = 4.72
+plateFreq = 2.5999999999999996
+plateStrength = 2.0
+moistureFreq = 2.05
+useClimate = false
+climateAltRange = 1.14
+metadata/_custom_type_script = "uid://7boxikbjeden"
