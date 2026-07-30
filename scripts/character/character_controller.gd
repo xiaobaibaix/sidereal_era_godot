@@ -106,6 +106,7 @@ var _cam_yaw: float = 0.0
 var _cam_pitch: float = -0.2
 var _cur_anim: String = ""
 var _cam_active: bool = false     # 本控制器当前是否在驱动相机(由 set_camera_active 切换)
+var _input_active: bool = false   # 角色是否响应键盘移动/跳跃(角色模式 true; 星球模式 false → WASD 不控制角色)
 var _cam_snap: bool = false       # 接管相机后第一帧直接放到位(不 lerp), 避免从旧位置(可能在星球内)飞入
 var _cam_anchor_r: float = -1.0   # 平滑后的相机锚点"离球心半径"(消竖直颤抖); <0 = 未初始化
 var _cam_dist_target: float = 8.0 # 滚轮设定的目标距离(_ready 初始化为 cam_distance)
@@ -265,14 +266,17 @@ func _physics_process(delta: float) -> void:
 		fwd_t = _project_on_tangent(-global_transform.basis.z)          # 无相机: 用当前朝向
 	var right_t := fwd_t.cross(_up).normalized()
 
-	# --- 输入 → 期望水平速度 ---
-	var iy := Input.get_action_strength("move_forward") - Input.get_action_strength("move_back")
-	var ix := Input.get_action_strength("move_right") - Input.get_action_strength("move_left")
+	# --- 输入 → 期望水平速度(仅角色模式响应键盘; 星球模式 _input_active=false → 不读 WASD, 角色静止贴地)---
+	var iy := 0.0
+	var ix := 0.0
+	if _input_active:
+		iy = Input.get_action_strength("move_forward") - Input.get_action_strength("move_back")
+		ix = Input.get_action_strength("move_right") - Input.get_action_strength("move_left")
 	var wish := (right_t * ix + fwd_t * iy)
 	var moving := wish.length() > 0.05
 	if moving:
 		wish = wish.normalized()
-	var sprinting := Input.is_physical_key_pressed(KEY_SHIFT)
+	var sprinting := _input_active and Input.is_physical_key_pressed(KEY_SHIFT)
 	var target_speed := (run_speed if sprinting else walk_speed) if moving else 0.0
 	var target_v := wish * target_speed
 
@@ -283,7 +287,7 @@ func _physics_process(delta: float) -> void:
 	# --- 重力 / 跳跃(沿 up 的分量) ---
 	var g_mag := _gravity_vector().length()
 	_v_up -= g_mag * delta
-	if _grounded and Input.is_action_just_pressed("jump"):
+	if _input_active and _grounded and Input.is_action_just_pressed("jump"):
 		_v_up = jump_speed
 		_grounded = false
 
@@ -398,6 +402,9 @@ func _update_animation(speed: float) -> void:
 ## active=false: 停止驱动、不再碰鼠标(相机位姿交给外部, 如轨道相机)。
 ## 注: control_camera=false(外部完全自驱)时本方法不接管相机, 仅保证不干扰。
 func set_camera_active(active: bool) -> void:
+	# 角色是否响应键盘移动: 直接跟随 active(= CameraDirector 的"是否角色模式")。与相机驱动分开 ——
+	# 相机驱动还要看 control_camera/相机是否存在, 但键盘控制只看是不是角色模式。
+	_input_active = active
 	_cam_active = active and control_camera and _camera != null
 	if not _cam_active:
 		_cam_anchor_r = -1.0   # 交出相机驱动: 重置高度平滑, 下次接管时重新初始化(过渡结束不跳)
