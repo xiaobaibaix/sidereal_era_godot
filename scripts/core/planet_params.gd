@@ -261,8 +261,12 @@ signal bulk_changed
 @export_range(0.0, 8.0, 0.1) var smallTriPixels: float = 1.0:
 	set(v): smallTriPixels = v; param_changed.emit("smallTriPixels")
 ## 遮挡剔除(Hi-Z): 用上一帧深度金字塔(reverse-Z 取 min)剔掉被山体/近处地形挡住的背面 patch。
-## 1 帧延迟(快转时被挡→转出可能瞬间 pop-in, 可接受)。关掉可排查遮挡误剔。
-@export var occlusionCulling: bool = true:
+## 【默认关】它用上一帧深度, 快速运动时 disocclusion(新转出/靠近而露出的地形被旧深度误判遮挡)会
+## 露空洞三角形 —— 这是单遍"上一帧深度"遮挡的**固有缺陷**, 需两阶段遮挡剔除才能根治(成本高, 且不
+## 适配本 MultiMesh 提交模型)。而地平线剔除已剔行星背面(遮挡大头)、视锥+小三角剔除各司其职, Hi-Z
+## 的额外收益有限, 不值得为它引入运动露洞。保留开关+基础设施, 供将来真正实现两阶段遮挡时再启用。
+## 想临时试开: 运行时按 F3, 或在此设 true(注意快速运动会露洞)。
+@export var occlusionCulling: bool = false:
 	set(v): occlusionCulling = v; param_changed.emit("occlusionCulling")
 ## 遮挡剔除的最低高度门限(占半径的比例)。相机离地表高度 < 半径×此值时**自动关闭**遮挡剔除。
 ## 原因: 遮挡用上一帧深度(约 1~2 帧延迟), 贴近地表快速平移时"上一帧被挡、这一帧转出来"的地形会
